@@ -11,3 +11,5 @@ mainWindow = MainWindow()
 mainWindow.show()
 
 qapp.exec()
+
+# This is a test comment
