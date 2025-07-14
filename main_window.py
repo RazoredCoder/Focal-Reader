@@ -118,17 +118,14 @@ class MainWindow(QMainWindow):
             print("Text area is empty.")
             return
         
-        self.sentences = self.tokenizer.tokenize(full_text)
-        self.current_sentence_index = 0
-
         if not self.sentences:
-            print("No sentences found in the text.")
-            return
-        
-        text_to_speak = self.sentences[self.current_sentence_index]
+            full_text = self.text_area.toPlainText()
+            if not full_text: return
+            self.sentences = self.tokenizer.tokenize(full_text)
+            self.current_sentence_index = 0
 
         self.thread = QThread()
-        self.worker = Worker(self.azure_key, self.azure_region, text_to_speak)
+        self.worker = Worker(self.azure_key, self.azure_region, self.sentences)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -151,8 +148,17 @@ class MainWindow(QMainWindow):
         error_dialog.exec()
 
     def pause_tts(self):
+        if self.worker:
+            self.worker.stop()
         print("Pause button clicked!")
     
+    def on_playback_finished(self):
+        self.play_button.setEnabled(True)
+
+        self.sentences = []
+        self.current_sentence_index = 0
+        print("Playback finished.")
+
     def skip_tts(self):
         print("Skip button clicked!")
 
@@ -168,12 +174,14 @@ class MainWindow(QMainWindow):
 class Worker(QObject):
     finished = Signal()
     error = Signal(str)
+    progress = Signal(int)
     
-    def __init__(self, key, region, text):
+    def __init__(self, key, region, sentences):
         super().__init__()
         self.key = key
         self.region = region
-        self.text = text
+        self.sentences = sentences
+        self._is_running = True
 
     def run(self):
         error_message = None
@@ -184,20 +192,28 @@ class Worker(QObject):
             
             speech_config = speechsdk.SpeechConfig(subscription=self.key, region=self.region)
             speech_synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
-            result = speech_synthesizer.speak_text_async(self.text).get()
-        
-            if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-                if result.reason == speechsdk.ResultReason.Canceled:
-                    error_message = "Authentication failed. Please check your Azure credentials in File > Settings."
-                else:    
-                    error_message = f"Speech synthesis failed. Reason: {result.reason}"
+
+            index = 0
+            while index < len(self.sentences) and self._is_running:
+                self.progress.emit(index)
+                text = self.sentences[index]
+
+                result = speech_synthesizer.speak_text_async(text).get()
+                if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    if result.reason == speechsdk.ResultReason.Canceled:
+                        error_message = "Authentication failed. Please check your Azure credentials in File > Settings."
+                    
+                    else:
+                        error_message = f"Speech synthesis failed. Reason: {result.reason}"
+                    
+                    raise Exception(error_message)
                 
+                index +=1
 
         except Exception as e:
-            error_message = str(e)
+            self.error.emit(str(e))
         
         finally:
-            if error_message:
-                self.error.emit(error_message)
-            
             self.finished.emit()
+    def stop(self):
+        self._is_running = False
