@@ -2,6 +2,7 @@ from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTextEdit, QHBo
 import os
 import azure.cognitiveservices.speech as speechsdk
 import nltk
+from settings_dialog import SettingsDialog
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -17,7 +18,12 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Focal Reader")
         self.resize(800,600 )
-        
+
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File") # "&"" creates an underlined shortcut
+        setting_action = file_menu.addAction("Settings")
+        setting_action.triggered.connect(self.open_setting)
+
         self.container = QWidget()
         self.setCentralWidget(self.container)
         
@@ -48,6 +54,10 @@ class MainWindow(QMainWindow):
         self.pause_button.clicked.connect(self.pause_tts)
         self.skip_button.clicked.connect(self.skip_tts)
         self.load_button.clicked.connect(self.open_file)
+    
+    def open_setting(self):
+        dialog = SettingsDialog(self)
+        dialog.exec()
     
     def play_tts(self):
         self.full_text = self.text_area.toPlainText()
