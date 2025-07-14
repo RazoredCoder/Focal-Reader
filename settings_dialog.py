@@ -26,3 +26,10 @@ class SettingsDialog(QDialog):
 
         self.save_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
+    
+    def get_values(self):
+        return self.key_input.text(), self.region_input.text()
+    
+    def set_values(self, key, region):
+        self.key_input.setText(key)
+        self.region_input.setText(region)
