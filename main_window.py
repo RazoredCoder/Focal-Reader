@@ -13,11 +13,10 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from settings_dialog import SettingsDialog
 
 # =================================================================================
-# WORKER CLASS (QMediaPlayer Version)
-# Fetches audio data from Azure but does NOT play it.
+# WORKER CLASS (Stable Version)
+# This worker's only job is to fetch audio data for one sentence.
 # =================================================================================
 class Worker(QObject):
-    # This signal now emits the raw audio data on success
     finished = Signal(QByteArray)
     error = Signal(str)
 
@@ -33,23 +32,16 @@ class Worker(QObject):
                 raise ValueError("Azure credentials are not set.")
             
             speech_config = speechsdk.SpeechConfig(subscription=self.key, region=self.region)
-            # We pass audio_config=None to get the data in memory
             synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
             result = synthesizer.speak_text_async(self.text).get()
 
-            # On success, emit the audio data as a QByteArray
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                audio_data = result.audio_data
-                self.finished.emit(QByteArray(audio_data))
+                self.finished.emit(QByteArray(result.audio_data))
                 return
             
-            # Handle known error cases
             error_message = ""
             if result.reason == speechsdk.ResultReason.Canceled:
-                cancellation_details = result.cancellation_details
-                error_message = f"Synthesis Canceled: {cancellation_details.reason}. "
-                if cancellation_details.reason == speechsdk.CancellationReason.Error:
-                    error_message += f"Error Details: {cancellation_details.error_details}"
+                error_message = "Authentication failed. Please check your Azure credentials and network connection."
             else:
                 error_message = f"Speech synthesis failed. Reason: {result.reason}"
             
@@ -59,8 +51,7 @@ class Worker(QObject):
             self.error.emit(str(e))
 
 # =================================================================================
-# MAIN WINDOW CLASS (QMediaPlayer Version)
-# Manages the UI, state, and uses QMediaPlayer for stable playback.
+# MAIN WINDOW CLASS (Stable Version)
 # =================================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -68,21 +59,17 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.worker = None
         
-        # --- State Machine ---
-        self.playback_state = "STOPPED" # "STOPPED", "PLAYING", "PAUSED"
+        self.playback_state = "STOPPED"
         self.sentences = []
         self.current_sentence_index = 0
         
-        # --- Media Player Setup ---
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
         self.buffer = QBuffer()
         
-        # This signal is our new, stable loop trigger
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         
-        # --- Standard Setup ---
         self._setup_config_and_nlp()
         self._setup_ui()
         self.load_and_set_credentials()
@@ -137,15 +124,14 @@ class MainWindow(QMainWindow):
         if self.playback_state == "PLAYING":
             return
 
-        if self.playback_state == "STOPPED":
-            if not self.azure_key or not self.azure_region:
-                self.open_settings(); return
-            
-            full_text = self.text_area.toPlainText()
-            if not full_text: return
-            
-            self.sentences = self.tokenizer.tokenize(full_text)
-            self.current_sentence_index = 0
+        if not self.azure_key or not self.azure_region:
+            self.open_settings(); return
+        
+        full_text = self.text_area.toPlainText()
+        if not full_text: return
+        
+        self.sentences = self.tokenizer.tokenize(full_text)
+        self.current_sentence_index = 0
 
         if not self.sentences: return
 
@@ -171,14 +157,11 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self.on_tts_error)
         self.worker.finished.connect(self.play_audio_data)
 
-        # We are removing the automatic cleanup connections here
         self.thread.started.connect(self.worker.run)
         self.thread.start()
 
     def play_audio_data(self, audio_data):
-        # This method receives the audio from the worker and plays it
         if not audio_data or self.playback_state != "PLAYING":
-            # If no audio data, or if user hit stop while fetching, end playback
             self.on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
             return
 
@@ -191,7 +174,6 @@ class MainWindow(QMainWindow):
         self.player.play()
 
     def on_media_status_changed(self, status):
-        # This is our stable playback loop trigger
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self.playback_state == "PLAYING":
             next_index = self.current_sentence_index + 1
             if next_index < len(self.sentences):
@@ -201,27 +183,21 @@ class MainWindow(QMainWindow):
                 self.stop_tts()
 
     def stop_tts(self):
-        if self.playback_state == "STOPPED":
-            return
-
-        print("Stopping playback...")
+        if self.playback_state == "STOPPED": return
+            
         self.playback_state = "STOPPED"
-
-        # Stop the QMediaPlayer, which is handling the audio
         self.player.stop()
-
-        # Safely quit and clean up the thread if it exists
+        
         if self.thread and self.thread.isRunning():
             self.thread.quit()
-            self.thread.wait() # Wait for the thread to fully stop
-
+            self.thread.wait()
+        
         self.thread = None
         self.worker = None
 
-        # Reset sentences and UI state
         self.sentences = []
         self.current_sentence_index = 0
-
+        
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
@@ -266,4 +242,3 @@ class MainWindow(QMainWindow):
 
     def load_and_set_credentials(self):
         self.azure_key, self.azure_region = self.load_settings()
-
