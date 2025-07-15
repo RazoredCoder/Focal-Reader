@@ -1,44 +1,112 @@
-from settings_dialog import SettingsDialog
-
-from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTextEdit, QHBoxLayout, QPushButton, QFileDialog, QMessageBox
-from PySide6.QtCore import QObject, QThread, Signal
-
 import os
-from appdirs import AppDirs
+import sys
 import configparser
-
 import nltk
 import azure.cognitiveservices.speech as speechsdk
+from appdirs import AppDirs
 
+from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
+                               QHBoxLayout, QPushButton, QFileDialog, QMessageBox)
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+
+from settings_dialog import SettingsDialog
+
+# =================================================================================
+# WORKER CLASS (QMediaPlayer Version)
+# Fetches audio data from Azure but does NOT play it.
+# =================================================================================
+class Worker(QObject):
+    # This signal now emits the raw audio data on success
+    finished = Signal(QByteArray)
+    error = Signal(str)
+
+    def __init__(self, key, region, text_to_speak):
+        super().__init__()
+        self.key = key
+        self.region = region
+        self.text = text_to_speak
+
+    def run(self):
+        try:
+            if not self.key or not self.region:
+                raise ValueError("Azure credentials are not set.")
+            
+            speech_config = speechsdk.SpeechConfig(subscription=self.key, region=self.region)
+            # We pass audio_config=None to get the data in memory
+            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+            result = synthesizer.speak_text_async(self.text).get()
+
+            # On success, emit the audio data as a QByteArray
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                audio_data = result.audio_data
+                self.finished.emit(QByteArray(audio_data))
+                return
+            
+            # Handle known error cases
+            error_message = ""
+            if result.reason == speechsdk.ResultReason.Canceled:
+                cancellation_details = result.cancellation_details
+                error_message = f"Synthesis Canceled: {cancellation_details.reason}. "
+                if cancellation_details.reason == speechsdk.CancellationReason.Error:
+                    error_message += f"Error Details: {cancellation_details.error_details}"
+            else:
+                error_message = f"Speech synthesis failed. Reason: {result.reason}"
+            
+            self.error.emit(error_message)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+# =================================================================================
+# MAIN WINDOW CLASS (QMediaPlayer Version)
+# Manages the UI, state, and uses QMediaPlayer for stable playback.
+# =================================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.thread = None
-
-        APP_NAME = "FocalReader"
-        APP_AUTOR = "Maksymilian Wicinski"
-        dirs = AppDirs(APP_NAME, APP_AUTOR)
-        self.config_path = os.path.join(dirs.user_config_dir, "config.ini")
-
+        self.worker = None
+        
+        # --- State Machine ---
+        self.playback_state = "STOPPED" # "STOPPED", "PLAYING", "PAUSED"
         self.sentences = []
         self.current_sentence_index = 0
-        self.is_paused = False
+        
+        # --- Media Player Setup ---
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+        self.buffer = QBuffer()
+        
+        # This signal is our new, stable loop trigger
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        
+        # --- Standard Setup ---
+        self._setup_config_and_nlp()
+        self._setup_ui()
+        self.load_and_set_credentials()
 
+    def _setup_config_and_nlp(self):
+        APP_NAME = "FocalReader"
+        APP_AUTHOR = "Maksymilian Wicinski"
+        dirs = AppDirs(APP_NAME, APP_AUTHOR)
+        self.config_path = os.path.join(dirs.user_config_dir, "config.ini")
+        
         custom_abbreviations = {'etc', 'mr', 'mrs', 'ms', 'dr', 'prof', 'rev', 'capt', 'sgt', 'col', 'gen', 'vs', 'no', 'e.g', 'i.e', 'et al'}
         self.tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
         self.tokenizer._params.abbrev_types.update(custom_abbreviations)
 
+    def _setup_ui(self):
         self.setWindowTitle("Focal Reader")
-        self.resize(800,600 )
+        self.resize(800, 600)
 
         menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("&File") # "&"" creates an underlined shortcut
+        file_menu = menu_bar.addMenu("&File")
         setting_action = file_menu.addAction("Settings")
-        setting_action.triggered.connect(self.open_setting)
 
         self.container = QWidget()
         self.setCentralWidget(self.container)
-        
         self.layout = QVBoxLayout()
         self.container.setLayout(self.layout)
 
@@ -46,55 +114,147 @@ class MainWindow(QMainWindow):
         self.text_area.setReadOnly(True)
         self.layout.addWidget(self.text_area)
 
-        self.controls_container = QWidget()
-        self.controls_layout = QHBoxLayout()
-        self.controls_container.setLayout(self.controls_layout)
+        controls_container = QWidget()
+        controls_layout = QHBoxLayout(controls_container)
+        self.layout.addWidget(controls_container)
 
         self.play_button = QPushButton("Play")
-        self.pause_button = QPushButton("Pause")
-        self.skip_button = QPushButton("Next Paragraph")
+        self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
 
-        self.controls_layout.addWidget(self.play_button)
-        self.controls_layout.addWidget(self.pause_button)
-        self.controls_layout.addWidget(self.skip_button)
-        self.controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(self.play_button)
+        controls_layout.addWidget(self.stop_button)
 
-        self.layout.addWidget(self.controls_container)
-
+        setting_action.triggered.connect(self.open_settings)
         self.play_button.clicked.connect(self.play_tts)
-        self.pause_button.clicked.connect(self.pause_tts)
-        self.skip_button.clicked.connect(self.skip_tts)
+        self.stop_button.clicked.connect(self.stop_tts)
         self.load_button.clicked.connect(self.open_file)
 
-        self.azure_key = None
-        self.azure_region = None
-        self.load_and_set_credentials()
-    
-    def open_setting(self):
-        dialog = SettingsDialog(self)
+        self.stop_button.setEnabled(False)
+
+    def play_tts(self):
+        if self.playback_state == "PLAYING":
+            return
+
+        if self.playback_state == "STOPPED":
+            if not self.azure_key or not self.azure_region:
+                self.open_settings(); return
+            
+            full_text = self.text_area.toPlainText()
+            if not full_text: return
+            
+            self.sentences = self.tokenizer.tokenize(full_text)
+            self.current_sentence_index = 0
+
+        if not self.sentences: return
+
+        self.playback_state = "PLAYING"
+        self.play_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
         
+        self.play_sentence(self.current_sentence_index)
+
+    def play_sentence(self, index):
+        if self.playback_state != "PLAYING" or index >= len(self.sentences):
+            self.stop_tts()
+            return
+
+        self.current_sentence_index = index
+        text = self.sentences[index]
+        print(f"Fetching audio for sentence {index + 1}...")
+
+        self.thread = QThread(parent=self)
+        self.worker = Worker(self.azure_key, self.azure_region, text)
+        self.worker.moveToThread(self.thread)
+
+        self.worker.error.connect(self.on_tts_error)
+        self.worker.finished.connect(self.play_audio_data)
+
+        # We are removing the automatic cleanup connections here
+        self.thread.started.connect(self.worker.run)
+        self.thread.start()
+
+    def play_audio_data(self, audio_data):
+        # This method receives the audio from the worker and plays it
+        if not audio_data or self.playback_state != "PLAYING":
+            # If no audio data, or if user hit stop while fetching, end playback
+            self.on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
+            return
+
+        print(f"Playing audio for sentence {self.current_sentence_index + 1}...")
+        self.buffer.close()
+        self.buffer.setData(audio_data)
+        self.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        
+        self.player.setSourceDevice(self.buffer)
+        self.player.play()
+
+    def on_media_status_changed(self, status):
+        # This is our stable playback loop trigger
+        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.playback_state == "PLAYING":
+            next_index = self.current_sentence_index + 1
+            if next_index < len(self.sentences):
+                self.play_sentence(next_index)
+            else:
+                print("All sentences finished.")
+                self.stop_tts()
+
+    def stop_tts(self):
+        if self.playback_state == "STOPPED":
+            return
+
+        print("Stopping playback...")
+        self.playback_state = "STOPPED"
+
+        # Stop the QMediaPlayer, which is handling the audio
+        self.player.stop()
+
+        # Safely quit and clean up the thread if it exists
+        if self.thread and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait() # Wait for the thread to fully stop
+
+        self.thread = None
+        self.worker = None
+
+        # Reset sentences and UI state
+        self.sentences = []
+        self.current_sentence_index = 0
+
+        self.play_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+
+    def on_tts_error(self, error_message):
+        QMessageBox.critical(self, "An Azure TTS Error Occurred", error_message)
+        self.stop_tts()
+
+    def open_file(self):
+        if self.playback_state != "STOPPED": self.stop_tts()
+        
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Text File", "", "Text Files (*.txt)")
+        if file_path:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.text_area.setText(content)
+
+    def open_settings(self):
+        dialog = SettingsDialog(self)
         key, region = self.load_settings()
         if key and region:
             dialog.set_values(key, region)
-
         if dialog.exec():
             new_key, new_region = dialog.get_values()
             self.save_settings(new_key, new_region)
-            print("Setting saved!")
 
     def save_settings(self, key, region):
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-
         config = configparser.ConfigParser()
-        config['Azure'] = {
-            'SpeechKey': key,
-            'SpeechRegion': region
-        }
+        config['Azure'] = {'SpeechKey': key, 'SpeechRegion': region}
         with open(self.config_path, 'w') as configfile:
             config.write(configfile)
         self.load_and_set_credentials()
-    
+
     def load_settings(self):
         config = configparser.ConfigParser()
         if os.path.exists(self.config_path):
@@ -106,114 +266,4 @@ class MainWindow(QMainWindow):
 
     def load_and_set_credentials(self):
         self.azure_key, self.azure_region = self.load_settings()
-        print("Credentials loaded.")
 
-    def play_tts(self):
-        if not self.azure_key or not self.azure_region:
-            self.open_setting()
-            return
-        
-        full_text = self.text_area.toPlainText()
-        if not full_text:
-            print("Text area is empty.")
-            return
-        
-        if not self.sentences:
-            full_text = self.text_area.toPlainText()
-            if not full_text: return
-            self.sentences = self.tokenizer.tokenize(full_text)
-            self.current_sentence_index = 0
-
-        self.thread = QThread()
-        self.worker = Worker(self.azure_key, self.azure_region, self.sentences)
-        self.worker.moveToThread(self.thread)
-
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.worker.error.connect(self.on_tts_error)
-
-        self.thread.start()
-
-        self.play_button.setEnabled(False)
-        self.thread.finished.connect(lambda: self.play_button.setEnabled(True))
-
-    def on_tts_error(self, error_message):
-        error_dialog = QMessageBox()
-        error_dialog.setIcon(QMessageBox.Icon.Critical)
-        error_dialog.setText("An Azure TTS Error Occurred")
-        error_dialog.setInformativeText(error_message)
-        error_dialog.setWindowTitle("Error")
-        error_dialog.exec()
-
-    def pause_tts(self):
-        if self.worker:
-            self.worker.stop()
-        print("Pause button clicked!")
-    
-    def on_playback_finished(self):
-        self.play_button.setEnabled(True)
-
-        self.sentences = []
-        self.current_sentence_index = 0
-        print("Playback finished.")
-
-    def skip_tts(self):
-        print("Skip button clicked!")
-
-    def open_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Text File", "", "Text Files (*.txt)")
-
-        if file_path:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            self.text_area.setText(content)
-
-
-class Worker(QObject):
-    finished = Signal()
-    error = Signal(str)
-    progress = Signal(int)
-    
-    def __init__(self, key, region, sentences):
-        super().__init__()
-        self.key = key
-        self.region = region
-        self.sentences = sentences
-        self._is_running = True
-
-    def run(self):
-        error_message = None
-        
-        try:
-            if not self.key or not self.region:
-                raise ValueError("Azure credentials are not set.")
-            
-            speech_config = speechsdk.SpeechConfig(subscription=self.key, region=self.region)
-            speech_synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
-
-            index = 0
-            while index < len(self.sentences) and self._is_running:
-                self.progress.emit(index)
-                text = self.sentences[index]
-
-                result = speech_synthesizer.speak_text_async(text).get()
-                if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    if result.reason == speechsdk.ResultReason.Canceled:
-                        error_message = "Authentication failed. Please check your Azure credentials in File > Settings."
-                    
-                    else:
-                        error_message = f"Speech synthesis failed. Reason: {result.reason}"
-                    
-                    raise Exception(error_message)
-                
-                index +=1
-
-        except Exception as e:
-            self.error.emit(str(e))
-        
-        finally:
-            self.finished.emit()
-    def stop(self):
-        self._is_running = False
