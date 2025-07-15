@@ -6,7 +6,7 @@ import azure.cognitiveservices.speech as speechsdk
 from appdirs import AppDirs
 
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
                                QHBoxLayout, QPushButton, QFileDialog, QMessageBox)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -14,19 +14,28 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from settings_dialog import SettingsDialog
 
 # =================================================================================
-# CLICKABLE TEXT EDIT WIDGET
-# We subclass QTextEdit to add our own custom click behaviour
+# ENHANCED TEXT EDIT WIDGET
+# Now detects both clicks and mouse movement for highlighting.
 # =================================================================================
-class ClickableTextEdit(QTextEdit):
+class InteractiveTextEdit(QTextEdit):
     clicked_at_pos = Signal(int)
+    hovered_at_pos = Signal(int)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         cursor = self.cursorForPosition(event.pos())
         position = cursor.position()
-
-        print(f"Mouse clicked at character position {position}")
         self.clicked_at_pos.emit(position)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        cursor = self.cursorForPosition(event.pos())
+        position = cursor.position()
+        self.hovered_at_pos.emit(position)
 
 
 # =================================================================================
@@ -81,6 +90,10 @@ class MainWindow(QMainWindow):
         self.sentences = []
         self.sentence_spans = []
         self.current_sentence_index = 0
+
+        self.playback_highlighter = None
+        self.hover_highlighter = None
+        self._setup_formats()
         
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -93,6 +106,13 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self.load_and_set_credentials()
 
+    def _setup_formats(self):
+        self.playback_format = QTextCharFormat()
+        self.playback_format.setBackground(QColor("#FFF9C4"))
+
+        self.hover_format = QTextCharFormat()
+        self.hover_format.setBackground(QColor("#F5F5F5"))
+    
     def _setup_config_and_nlp(self):
         APP_NAME = "FocalReader"
         APP_AUTHOR = "Maksymilian Wicinski"
@@ -116,7 +136,7 @@ class MainWindow(QMainWindow):
         self.layout = QVBoxLayout()
         self.container.setLayout(self.layout)
 
-        self.text_area = ClickableTextEdit()
+        self.text_area = InteractiveTextEdit()
         self.text_area.setReadOnly(True)
         self.layout.addWidget(self.text_area)
 
@@ -138,18 +158,38 @@ class MainWindow(QMainWindow):
         self.load_button.clicked.connect(self.open_file)
 
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
+        self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
 
         self.stop_button.setEnabled(False)
 
-    def on_text_area_clicked(self, position):
-        print(f"MainWindow received click at postion: {position}")
+    def _apply_highlight(self, start, end, text_format):
+        cursor = self.text_area.textCursor()
+        cursor.setPosition(start)
+        cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, end - start)
+        cursor.setCharFormat(text_format)
+        return cursor
+    
+    def _clear_highlight(self, highlighter):
+        if highlighter:
+            highlighter.setCharFormat(QTextCharFormat())
 
+    def on_text_area_hovered(self, position):
+        if self.playback_state == "PLAYING":
+            return
+        
+        self._clear_highlight(self.hover_highlighter)
+
+        for i, (start, end) in enumerate(self.sentence_spans):
+            if start <= position < end:
+                self.hover_highlighter = self._apply_highlight(start, end, self.hover_format)
+                break
+
+    def on_text_area_clicked(self, position):
         if not self.sentence_spans:
             print("No text loaded to play.")
             return
         
-        if self.playback_state == "PLAYING":
-            self.stop_tts()
+        if self.playback_state == "PLAYING": self.stop_tts()
 
         target_sentence_index = -1
         for i, (start, end) in enumerate(self.sentence_spans):
@@ -158,11 +198,8 @@ class MainWindow(QMainWindow):
                 break
         
         if target_sentence_index != -1:
-            print(f"Clicked position belongs to sentence index: {target_sentence_index}")
             self.current_sentence_index = target_sentence_index
             self.play_tts()
-        else:
-            print("Could not determine sentence for clicked position.")
 
     def play_tts(self):
         if self.playback_state == "PLAYING":
@@ -193,6 +230,11 @@ class MainWindow(QMainWindow):
         text = self.sentences[index]
         print(f"Fetching audio for sentence {index + 1}...")
 
+        self._clear_highlight(self.hover_highlighter)
+        self._clear_highlight(self.playback_highlighter)
+        start, end = self.sentence_spans[index]
+        self.playback_highlighter = self._apply_highlight(start, end, self.playback_format)
+        
         self.thread = QThread(parent=self)
         self.worker = Worker(self.azure_key, self.azure_region, text)
         self.worker.moveToThread(self.thread)
@@ -231,7 +273,6 @@ class MainWindow(QMainWindow):
 
     def stop_tts(self):
         if self.playback_state == "STOPPED": return
-            
         self.playback_state = "STOPPED"
         self.player.stop()
         
@@ -242,8 +283,8 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.worker = None
 
-        # self.sentences = []
-        # self.current_sentence_index = 0
+        self._clear_highlight(self.playback_highlighter)
+        self._clear_highlight(self.hover_highlighter)
         
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -271,10 +312,8 @@ class MainWindow(QMainWindow):
             return
         
         spans = self.tokenizer.span_tokenize(full_text)
-
         self.sentence_spans = list(spans)
         self.sentences = [full_text[start:end] for start, end in self.sentence_spans]
-
         print(f"Processed {len(self.sentences)} sentences.")
         self.current_sentence_index = 0
 
