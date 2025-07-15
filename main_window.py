@@ -77,7 +77,9 @@ class MainWindow(QMainWindow):
         self.worker = None
         
         self.playback_state = "STOPPED"
+        
         self.sentences = []
+        self.sentence_spans = []
         self.current_sentence_index = 0
         
         self.player = QMediaPlayer()
@@ -142,26 +144,21 @@ class MainWindow(QMainWindow):
     def on_text_area_clicked(self, position):
         print(f"MainWindow received click at postion: {position}")
 
+        if not self.sentence_spans:
+            print("No text loaded to play.")
+            return
+        
         if self.playback_state == "PLAYING":
             self.stop_tts()
 
-        full_text = self.text_area.toPlainText()
-        if not full_text: return
-        self.sentences = self.tokenizer.tokenize(full_text)
-
-        char_count = 0
         target_sentence_index = -1
-        for i, sentence in enumerate(self.sentences):
-            # The length of the sentence plus a space for separation
-            sentence_lenght = len(sentence) + 1
-            if char_count <= position < char_count + sentence_lenght:
+        for i, (start, end) in enumerate(self.sentence_spans):
+            if start <= position < end:
                 target_sentence_index = i
                 break
-            char_count += sentence_lenght
         
         if target_sentence_index != -1:
             print(f"Clicked position belongs to sentence index: {target_sentence_index}")
-
             self.current_sentence_index = target_sentence_index
             self.play_tts()
         else:
@@ -175,12 +172,11 @@ class MainWindow(QMainWindow):
             self.open_settings(); return
         
         if not self.sentences:
-            full_text = self.text_area.toPlainText()
-            if not full_text: return
-            self.sentences = self.tokenizer.tokenize(full_text)
-            self.current_sentence_index = 0
+            self._process_text()
 
-        if not self.sentences: return
+        if not self.sentences: 
+            print("No sentences to play.")
+            return
 
         self.playback_state = "PLAYING"
         self.play_button.setEnabled(False)
@@ -264,7 +260,23 @@ class MainWindow(QMainWindow):
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             self.text_area.setText(content)
+            self._process_text()
+
+    def _process_text(self):
+        print("Processing text...")
+        full_text = self.text_area.toPlainText()
+        if not full_text:
             self.sentences = []
+            self.sentence_spans = []
+            return
+        
+        spans = self.tokenizer.span_tokenize(full_text)
+
+        self.sentence_spans = list(spans)
+        self.sentences = [full_text[start:end] for start, end in self.sentence_spans]
+
+        print(f"Processed {len(self.sentences)} sentences.")
+        self.current_sentence_index = 0
 
     def open_settings(self):
         dialog = SettingsDialog(self)
