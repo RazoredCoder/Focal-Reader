@@ -6,11 +6,28 @@ import azure.cognitiveservices.speech as speechsdk
 from appdirs import AppDirs
 
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
                                QHBoxLayout, QPushButton, QFileDialog, QMessageBox)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from settings_dialog import SettingsDialog
+
+# =================================================================================
+# CLICKABLE TEXT EDIT WIDGET
+# We subclass QTextEdit to add our own custom click behaviour
+# =================================================================================
+class ClickableTextEdit(QTextEdit):
+    clicked_at_pos = Signal(int)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        cursor = self.cursorForPosition(event.pos())
+        position = cursor.position()
+
+        print(f"Mouse clicked at character position {position}")
+        self.clicked_at_pos.emit(position)
+
 
 # =================================================================================
 # WORKER CLASS (Stable Version)
@@ -97,7 +114,7 @@ class MainWindow(QMainWindow):
         self.layout = QVBoxLayout()
         self.container.setLayout(self.layout)
 
-        self.text_area = QTextEdit()
+        self.text_area = ClickableTextEdit()
         self.text_area.setReadOnly(True)
         self.layout.addWidget(self.text_area)
 
@@ -118,7 +135,37 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_tts)
         self.load_button.clicked.connect(self.open_file)
 
+        self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
+
         self.stop_button.setEnabled(False)
+
+    def on_text_area_clicked(self, position):
+        print(f"MainWindow received click at postion: {position}")
+
+        if self.playback_state == "PLAYING":
+            self.stop_tts()
+
+        full_text = self.text_area.toPlainText()
+        if not full_text: return
+        self.sentences = self.tokenizer.tokenize(full_text)
+
+        char_count = 0
+        target_sentence_index = -1
+        for i, sentence in enumerate(self.sentences):
+            # The length of the sentence plus a space for separation
+            sentence_lenght = len(sentence) + 1
+            if char_count <= position < char_count + sentence_lenght:
+                target_sentence_index = i
+                break
+            char_count += sentence_lenght
+        
+        if target_sentence_index != -1:
+            print(f"Clicked position belongs to sentence index: {target_sentence_index}")
+
+            self.current_sentence_index = target_sentence_index
+            self.play_tts()
+        else:
+            print("Could not determine sentence for clicked position.")
 
     def play_tts(self):
         if self.playback_state == "PLAYING":
@@ -127,11 +174,11 @@ class MainWindow(QMainWindow):
         if not self.azure_key or not self.azure_region:
             self.open_settings(); return
         
-        full_text = self.text_area.toPlainText()
-        if not full_text: return
-        
-        self.sentences = self.tokenizer.tokenize(full_text)
-        self.current_sentence_index = 0
+        if not self.sentences:
+            full_text = self.text_area.toPlainText()
+            if not full_text: return
+            self.sentences = self.tokenizer.tokenize(full_text)
+            self.current_sentence_index = 0
 
         if not self.sentences: return
 
@@ -166,6 +213,10 @@ class MainWindow(QMainWindow):
             return
 
         print(f"Playing audio for sentence {self.current_sentence_index + 1}...")
+        
+        self.player.stop()
+        self.player.setSourceDevice(None)
+
         self.buffer.close()
         self.buffer.setData(audio_data)
         self.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
@@ -195,8 +246,8 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.worker = None
 
-        self.sentences = []
-        self.current_sentence_index = 0
+        # self.sentences = []
+        # self.current_sentence_index = 0
         
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -213,6 +264,7 @@ class MainWindow(QMainWindow):
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             self.text_area.setText(content)
+            self.sentences = []
 
     def open_settings(self):
         dialog = SettingsDialog(self)
