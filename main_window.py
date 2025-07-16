@@ -144,23 +144,31 @@ class MainWindow(QMainWindow):
         controls_layout = QHBoxLayout(controls_container)
         self.layout.addWidget(controls_container)
 
+        self.prev_sentence_button = QPushButton("< Prev Sentence")
+        self.next_sentence_button = QPushButton("Next Sentence >")
         self.play_button = QPushButton("Play")
         self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
 
         controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(self.prev_sentence_button)
         controls_layout.addWidget(self.play_button)
+        controls_layout.addWidget(self.next_sentence_button)
         controls_layout.addWidget(self.stop_button)
 
         setting_action.triggered.connect(self.open_settings)
         self.play_button.clicked.connect(self.play_tts)
         self.stop_button.clicked.connect(self.stop_tts)
         self.load_button.clicked.connect(self.open_file)
+        self.prev_sentence_button.clicked.connect(self.previous_sentence)
+        self.next_sentence_button.clicked.connect(self.next_sentence)
 
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
         self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
 
         self.stop_button.setEnabled(False)
+        self.prev_sentence_button.setEnabled(False)
+        self.next_sentence_button.setEnabled(False)
 
     def _apply_highlight(self, start, end, text_format):
         cursor = self.text_area.textCursor()
@@ -201,6 +209,24 @@ class MainWindow(QMainWindow):
             self.current_sentence_index = target_sentence_index
             self.play_tts()
 
+    def previous_sentence(self):
+        if not self.sentences: return
+        if self.playback_state == "PLAYING": self.stop_tts()
+
+        new_index = self.current_sentence_index - 1
+        if new_index >= 0:
+            self.current_sentence_index = new_index
+            self.play_tts()
+
+    def next_sentence(self):
+        if not self.sentences: return
+        if self.playback_state == "PLAYING": self.stop_tts()
+
+        new_index = self.current_sentence_index + 1
+        if new_index < len(self.sentences):
+            self.current_sentence_index = new_index
+            self.play_tts()
+    
     def play_tts(self):
         if self.playback_state == "PLAYING":
             return
@@ -288,6 +314,8 @@ class MainWindow(QMainWindow):
         
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.prev_sentence_button.setEnabled(True if self.sentences else False)
+        self.next_sentence_button.setEnabled(True if self.sentences else False)
 
     def on_tts_error(self, error_message):
         QMessageBox.critical(self, "An Azure TTS Error Occurred", error_message)
@@ -309,6 +337,8 @@ class MainWindow(QMainWindow):
         if not full_text:
             self.sentences = []
             self.sentence_spans = []
+            self.prev_sentence_button.setEnabled(False)
+            self.next_sentence_button.setEnabled(False)
             return
         
         spans = self.tokenizer.span_tokenize(full_text)
@@ -316,6 +346,8 @@ class MainWindow(QMainWindow):
         self.sentences = [full_text[start:end] for start, end in self.sentence_spans]
         print(f"Processed {len(self.sentences)} sentences.")
         self.current_sentence_index = 0
+        self.prev_sentence_button.setEnabled(True)
+        self.next_sentence_button.setEnabled(True)
 
     def open_settings(self):
         dialog = SettingsDialog(self)
