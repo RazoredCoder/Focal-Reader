@@ -4,6 +4,8 @@ import configparser
 import nltk
 import azure.cognitiveservices.speech as speechsdk
 from appdirs import AppDirs
+import fitz  # Import for PyMuPDF
+import re # Import regular expressions for finding numbers
 
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat
@@ -15,12 +17,11 @@ from settings_dialog import SettingsDialog
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
-# Now detects both clicks and mouse movement for highlighting.
 # =================================================================================
 class InteractiveTextEdit(QTextEdit):
     clicked_at_pos = Signal(int)
     hovered_at_pos = Signal(int)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
@@ -37,10 +38,8 @@ class InteractiveTextEdit(QTextEdit):
         position = cursor.position()
         self.hovered_at_pos.emit(position)
 
-
 # =================================================================================
 # WORKER CLASS (Stable Version)
-# This worker's only job is to fetch audio data for one sentence.
 # =================================================================================
 class Worker(QObject):
     finished = Signal(QByteArray)
@@ -88,10 +87,10 @@ class MainWindow(QMainWindow):
         self.playback_state = "STOPPED"
         
         self.sentences = []
-        self.sentence_spans = []
+        self.sentence_spans = [] 
         self.paragraph_sentence_map = []
         self.current_sentence_index = 0
-
+        
         self.playback_highlighter = None
         self.hover_highlighter = None
         self._setup_formats()
@@ -109,19 +108,19 @@ class MainWindow(QMainWindow):
 
     def _setup_formats(self):
         self.playback_format = QTextCharFormat()
-        self.playback_format.setBackground(QColor("#FFF9C4"))
+        self.playback_format.setBackground(QColor("#FFF9C4")) 
 
         self.hover_format = QTextCharFormat()
         self.hover_format.setBackground(QColor("#F5F5F5"))
-    
+
     def _setup_config_and_nlp(self):
         APP_NAME = "FocalReader"
         APP_AUTHOR = "Maksymilian Wicinski"
         dirs = AppDirs(APP_NAME, APP_AUTHOR)
         self.config_path = os.path.join(dirs.user_config_dir, "config.ini")
         
-        custom_abbreviations = {'etc', 'mr', 'mrs', 'ms', 'dr', 'prof', 'rev', 'capt', 'sgt', 'col', 'gen', 'vs', 'no', 'e.g', 'i.e', 'et al'}
         self.tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
+        custom_abbreviations = {'etc', 'mr', 'mrs', 'ms', 'dr', 'prof', 'rev', 'capt', 'sgt', 'col', 'gen', 'vs', 'no', 'e.g', 'i.e', 'et al'}
         self.tokenizer._params.abbrev_types.update(custom_abbreviations)
 
     def _setup_ui(self):
@@ -145,11 +144,11 @@ class MainWindow(QMainWindow):
         controls_layout = QHBoxLayout(controls_container)
         self.layout.addWidget(controls_container)
 
-        self.prev_sentence_button = QPushButton("< Prev Sent")
-        self.next_sentence_button = QPushButton("Next Sent >")
         self.prev_paragraph_button = QPushButton("<< Prev Para")
-        self.next_paragraph_button = QPushButton("Next Para >>")
+        self.prev_sentence_button = QPushButton("< Prev Sent")
         self.play_button = QPushButton("Play")
+        self.next_sentence_button = QPushButton("Next Sent >")
+        self.next_paragraph_button = QPushButton("Next Para >>")
         self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
 
@@ -169,7 +168,7 @@ class MainWindow(QMainWindow):
         self.next_sentence_button.clicked.connect(self.next_sentence)
         self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
         self.next_paragraph_button.clicked.connect(self.next_paragraph)
-
+        
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
         self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
 
@@ -185,27 +184,21 @@ class MainWindow(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, end - start)
         cursor.setCharFormat(text_format)
         return cursor
-    
+
     def _clear_highlight(self, highlighter):
         if highlighter:
             highlighter.setCharFormat(QTextCharFormat())
 
     def on_text_area_hovered(self, position):
-        if self.playback_state == "PLAYING":
-            return
-        
+        if self.playback_state == "PLAYING": return
         self._clear_highlight(self.hover_highlighter)
-
         for i, (start, end) in enumerate(self.sentence_spans):
             if start <= position < end:
                 self.hover_highlighter = self._apply_highlight(start, end, self.hover_format)
                 break
-
+    
     def on_text_area_clicked(self, position):
-        if not self.sentence_spans:
-            print("No text loaded to play.")
-            return
-        
+        if not self.sentence_spans: return
         if self.playback_state == "PLAYING": self.stop_tts()
 
         target_sentence_index = -1
@@ -221,7 +214,7 @@ class MainWindow(QMainWindow):
     def previous_sentence(self):
         if not self.sentences: return
         if self.playback_state == "PLAYING": self.stop_tts()
-
+        
         new_index = self.current_sentence_index - 1
         if new_index >= 0:
             self.current_sentence_index = new_index
@@ -235,9 +228,9 @@ class MainWindow(QMainWindow):
         if new_index < len(self.sentences):
             self.current_sentence_index = new_index
             self.play_tts()
-    
+
     def previous_paragraph(self):
-        if not self.sentences: return
+        if not self.paragraph_sentence_map: return
         if self.playback_state == "PLAYING": self.stop_tts()
 
         current_para_index = -1
@@ -245,20 +238,21 @@ class MainWindow(QMainWindow):
             if self.current_sentence_index in para_sentences:
                 current_para_index = i
                 break
-            
+        
         if current_para_index > 0:
             prev_para_sentences = self.paragraph_sentence_map[current_para_index - 1]
             self.current_sentence_index = prev_para_sentences[0]
             self.play_tts()
 
     def next_paragraph(self):
-        if not self.sentences: return
+        if not self.paragraph_sentence_map: return
         if self.playback_state == "PLAYING": self.stop_tts()
 
         current_para_index = -1
         for i, para_sentences in enumerate(self.paragraph_sentence_map):
             if self.current_sentence_index in para_sentences:
                 current_para_index = i
+                break
         
         if current_para_index != -1 and current_para_index < len(self.paragraph_sentence_map) - 1:
             next_para_sentences = self.paragraph_sentence_map[current_para_index + 1]
@@ -270,10 +264,8 @@ class MainWindow(QMainWindow):
         if not self.azure_key or not self.azure_region:
             self.open_settings(); return
         
-        if not self.sentences: self._process_text()
-        if not self.sentences: 
-            print("No sentences to play.")
-            return
+        if not self.sentences: self._process_text(self.text_area.toPlainText())
+        if not self.sentences: return
 
         self.playback_state = "PLAYING"
         self.play_button.setEnabled(False)
@@ -287,18 +279,16 @@ class MainWindow(QMainWindow):
 
     def play_sentence(self, index):
         if self.playback_state != "PLAYING" or index >= len(self.sentences):
-            self.stop_tts()
-            return
+            self.stop_tts(); return
 
         self.current_sentence_index = index
         text = self.sentences[index]
-        print(f"Fetching audio for sentence {index + 1}...")
-
+        
         self._clear_highlight(self.hover_highlighter)
         self._clear_highlight(self.playback_highlighter)
         start, end = self.sentence_spans[index]
         self.playback_highlighter = self._apply_highlight(start, end, self.playback_format)
-        
+
         self.thread = QThread(parent=self)
         self.worker = Worker(self.azure_key, self.azure_region, text)
         self.worker.moveToThread(self.thread)
@@ -313,16 +303,12 @@ class MainWindow(QMainWindow):
         if not audio_data or self.playback_state != "PLAYING":
             self.on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
             return
-
-        print(f"Playing audio for sentence {self.current_sentence_index + 1}...")
         
         self.player.stop()
-        self.player.setSourceDevice(None)
-
+        self.player.setSourceDevice(None) 
         self.buffer.close()
         self.buffer.setData(audio_data)
         self.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
-        
         self.player.setSourceDevice(self.buffer)
         self.player.play()
 
@@ -332,7 +318,6 @@ class MainWindow(QMainWindow):
             if next_index < len(self.sentences):
                 self.play_sentence(next_index)
             else:
-                print("All sentences finished.")
                 self.stop_tts()
 
     def stop_tts(self):
@@ -346,10 +331,10 @@ class MainWindow(QMainWindow):
         
         self.thread = None
         self.worker = None
-
+        
         self._clear_highlight(self.playback_highlighter)
         self._clear_highlight(self.hover_highlighter)
-        
+
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         
@@ -366,49 +351,150 @@ class MainWindow(QMainWindow):
     def open_file(self):
         if self.playback_state != "STOPPED": self.stop_tts()
         
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Text File", "", "Text Files (*.txt)")
-        if file_path:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            self.text_area.setText(content)
-            self._process_text()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Open File", 
+            "", 
+            "All Readable Files (*.txt *.pdf);;Text Files (*.txt);;PDF Files (*.pdf)"
+        )
+        if not file_path:
+            return
 
-    def _process_text(self):
-        print("Processing text...")
-        full_text = self.text_area.toPlainText()
+        content = ""
+        try:
+            if file_path.lower().endswith('.pdf'):
+                content = self._read_pdf(file_path)
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            
+            self._process_text(content)
+        except Exception as e:
+            QMessageBox.critical(self, "Error Reading File", f"Could not read the file.\n\nError: {e}")
+
+    def _read_pdf(self, file_path):
+        print(f"Reading PDF: {file_path}")
+        full_text = []
+        page_numbers = {} 
+
+        with fitz.open(file_path) as doc:
+            print(f"PDF has {len(doc)} pages.")
+            for page_num, page in enumerate(doc):
+                page_height = page.rect.height
+                footer_margin = page_height * 0.90
+                
+                blocks = page.get_text("blocks")
+                for block in blocks:
+                    if block[6] == 0: 
+                        block_y_pos = block[1]
+                        block_text = block[4].strip()
+
+                        if block_y_pos > footer_margin:
+                            found_numbers = re.findall(r'\d+', block_text)
+                            if found_numbers:
+                                page_numbers[page_num + 1] = int(found_numbers[0])
+                                print(f"Found and skipped footer on page {page_num + 1}: '{block_text}'")
+                                continue 
+                        
+                        full_text.append(block_text)
         
+        print(f"Extracted page numbers: {page_numbers}")
+        # Join with single newlines to preserve all potential paragraph breaks
+        return "\n".join(full_text)
+
+    # --- MODIFIED: The definitive text processing method ---
+    def _process_text(self, raw_text):
+        print("Processing text...")
+        
+        # Reset all data structures
         self.sentences = []
         self.sentence_spans = []
         self.paragraph_sentence_map = []
-
-        if not full_text:
-            self.stop_tts() # Disables the buttons
+        
+        if not raw_text:
+            self.text_area.setText("")
+            self.stop_tts()
             return
+
+        # Part 1: Text Cleaning (As per your instructions)
+        chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword']
+        para_break_placeholder = " [PARA_BREAK] "
         
-        self.sentence_spans = list(self.tokenizer.span_tokenize(full_text))
-        self.sentences = [full_text[start:end] for start, end in self.sentence_spans]
-
-        paragraphs = full_text.split('\n\n')
-
-        current_sentence_index = 0
-        for para in paragraphs:
-            para = para.strip()
-            if not para: continue
-
-            sentences_in_para = self.tokenizer.tokenize(para)
-            num_sentences = len(sentences_in_para)
-
-            if num_sentences > 0:
-                indices = list(range(current_sentence_index, current_sentence_index + num_sentences))
-                self.paragraph_sentence_map.append(indices)
-                current_sentence_index += num_sentences
+        processed_text = raw_text.replace('\n\n', para_break_placeholder)
         
+        for keyword in chapter_keywords:
+            processed_text = re.sub(r'\n\s*(' + keyword + r'(\s+\d+)?)', rf'{para_break_placeholder}\1', processed_text, flags=re.IGNORECASE)
+
+        raw_sentence_spans = list(self.tokenizer.span_tokenize(processed_text))
+
+        cleaned_paragraphs = []
+        current_paragraph_sentences = []
+
+        for i, (start, end) in enumerate(raw_sentence_spans):
+            sentence_text = processed_text[start:end]
+            unwrapped_sentence = sentence_text.replace('\n', ' ').strip()
+            if unwrapped_sentence:
+                current_paragraph_sentences.append(unwrapped_sentence)
+
+            is_last_sentence = (i == len(raw_sentence_spans) - 1)
+            next_char_is_newline = (end < len(processed_text) and processed_text[end] == '\n')
+            
+            if (is_last_sentence or next_char_is_newline) and current_paragraph_sentences:
+                cleaned_paragraph = " ".join(current_paragraph_sentences)
+                cleaned_paragraphs.append(cleaned_paragraph)
+                current_paragraph_sentences = []
+
+        final_text = "\n\n".join(cleaned_paragraphs)
+        final_text = final_text.replace(para_break_placeholder.strip(), "\n\n")
+        self.text_area.setText(final_text)
+
+        # --- Part 2: Analyze the final, clean text to build the navigation maps ---
+        # This corrected version uses a single source of truth to avoid mapping errors.
+
+        full_text_for_analysis = self.text_area.toPlainText()
+
+        # 2a. Get the master list of sentences and their character positions (spans).
+        # This is our single source of truth.
+        self.sentence_spans = list(self.tokenizer.span_tokenize(full_text_for_analysis))
+        self.sentences = [full_text_for_analysis[start:end] for start, end in self.sentence_spans]
+
+        # 2b. Build the paragraph map by checking the text *between* sentences.
+        self.paragraph_sentence_map = []
+        if not self.sentences:
+            print("Processing complete: No sentences found.")
+            self.stop_tts()
+            return
+
+        current_paragraph_indices = []
+        for i, (start, end) in enumerate(self.sentence_spans):
+            current_paragraph_indices.append(i)
+
+            # A paragraph break is determined by finding "\n\n" between this sentence 
+            # and the next, or by reaching the end of the document.
+            is_last_sentence = (i == len(self.sentence_spans) - 1)
+
+            # Define the region of text to check for a paragraph break.
+            check_start = end
+            check_end = len(full_text_for_analysis)
+            if not is_last_sentence:
+                # Look only between the end of this sentence and the start of the next one.
+                check_end = self.sentence_spans[i + 1][0]
+            
+            intervening_text = full_text_for_analysis[check_start:check_end]
+
+            # If we find a double newline or it's the last sentence, this paragraph is complete.
+            if "\n\n" in intervening_text or is_last_sentence:
+                self.paragraph_sentence_map.append(current_paragraph_indices)
+                current_paragraph_indices = [] # Reset for the next paragraph.
+
+        # --- Finalization ---
         print(f"Processed {len(self.sentences)} sentences in {len(self.paragraph_sentence_map)} paragraphs.")
         self.current_sentence_index = 0
-        self.prev_sentence_button.setEnabled(True)
-        self.next_sentence_button.setEnabled(True)
-        self.prev_paragraph_button.setEnabled(True)
-        self.next_paragraph_button.setEnabled(True)
+        nav_enabled = bool(self.sentences) # More Pythonic way to set the flag
+        self.prev_sentence_button.setEnabled(nav_enabled)
+        self.next_sentence_button.setEnabled(nav_enabled)
+        self.prev_paragraph_button.setEnabled(nav_enabled)
+        self.next_paragraph_button.setEnabled(nav_enabled)
 
     def open_settings(self):
         dialog = SettingsDialog(self)
