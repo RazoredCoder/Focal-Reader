@@ -89,6 +89,7 @@ class MainWindow(QMainWindow):
         
         self.sentences = []
         self.sentence_spans = []
+        self.paragraph_sentence_map = []
         self.current_sentence_index = 0
 
         self.playback_highlighter = None
@@ -144,16 +145,20 @@ class MainWindow(QMainWindow):
         controls_layout = QHBoxLayout(controls_container)
         self.layout.addWidget(controls_container)
 
-        self.prev_sentence_button = QPushButton("< Prev Sentence")
-        self.next_sentence_button = QPushButton("Next Sentence >")
+        self.prev_sentence_button = QPushButton("< Prev Sent")
+        self.next_sentence_button = QPushButton("Next Sent >")
+        self.prev_paragraph_button = QPushButton("<< Prev Para")
+        self.next_paragraph_button = QPushButton("Next Para >>")
         self.play_button = QPushButton("Play")
         self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
 
         controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(self.prev_paragraph_button)
         controls_layout.addWidget(self.prev_sentence_button)
         controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.next_sentence_button)
+        controls_layout.addWidget(self.next_paragraph_button)
         controls_layout.addWidget(self.stop_button)
 
         setting_action.triggered.connect(self.open_settings)
@@ -162,6 +167,8 @@ class MainWindow(QMainWindow):
         self.load_button.clicked.connect(self.open_file)
         self.prev_sentence_button.clicked.connect(self.previous_sentence)
         self.next_sentence_button.clicked.connect(self.next_sentence)
+        self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
+        self.next_paragraph_button.clicked.connect(self.next_paragraph)
 
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
         self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
@@ -169,6 +176,8 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.prev_sentence_button.setEnabled(False)
         self.next_sentence_button.setEnabled(False)
+        self.prev_paragraph_button.setEnabled(False)
+        self.next_paragraph_button.setEnabled(False)
 
     def _apply_highlight(self, start, end, text_format):
         cursor = self.text_area.textCursor()
@@ -227,16 +236,41 @@ class MainWindow(QMainWindow):
             self.current_sentence_index = new_index
             self.play_tts()
     
-    def play_tts(self):
-        if self.playback_state == "PLAYING":
-            return
+    def previous_paragraph(self):
+        if not self.sentences: return
+        if self.playback_state == "PLAYING": self.stop_tts()
 
+        current_para_index = -1
+        for i, para_sentences in enumerate(self.paragraph_sentence_map):
+            if self.current_sentence_index in para_sentences:
+                current_para_index = i
+                break
+            
+        if current_para_index > 0:
+            prev_para_sentences = self.paragraph_sentence_map[current_para_index - 1]
+            self.current_sentence_index = prev_para_sentences[0]
+            self.play_tts()
+
+    def next_paragraph(self):
+        if not self.sentences: return
+        if self.playback_state == "PLAYING": self.stop_tts()
+
+        current_para_index = -1
+        for i, para_sentences in enumerate(self.paragraph_sentence_map):
+            if self.current_sentence_index in para_sentences:
+                current_para_index = i
+        
+        if current_para_index != -1 and current_para_index < len(self.paragraph_sentence_map) - 1:
+            next_para_sentences = self.paragraph_sentence_map[current_para_index + 1]
+            self.current_sentence_index = next_para_sentences[0]
+            self.play_tts()
+
+    def play_tts(self):
+        if self.playback_state == "PLAYING": return
         if not self.azure_key or not self.azure_region:
             self.open_settings(); return
         
-        if not self.sentences:
-            self._process_text()
-
+        if not self.sentences: self._process_text()
         if not self.sentences: 
             print("No sentences to play.")
             return
@@ -244,6 +278,10 @@ class MainWindow(QMainWindow):
         self.playback_state = "PLAYING"
         self.play_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.prev_sentence_button.setEnabled(True)
+        self.next_sentence_button.setEnabled(True)
+        self.prev_paragraph_button.setEnabled(True)
+        self.next_paragraph_button.setEnabled(True)
         
         self.play_sentence(self.current_sentence_index)
 
@@ -314,8 +352,12 @@ class MainWindow(QMainWindow):
         
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.prev_sentence_button.setEnabled(True if self.sentences else False)
-        self.next_sentence_button.setEnabled(True if self.sentences else False)
+        
+        nav_enabled = True if self.sentences else False
+        self.prev_sentence_button.setEnabled(nav_enabled)
+        self.next_sentence_button.setEnabled(nav_enabled)
+        self.prev_paragraph_button.setEnabled(nav_enabled)
+        self.next_paragraph_button.setEnabled(nav_enabled)
 
     def on_tts_error(self, error_message):
         QMessageBox.critical(self, "An Azure TTS Error Occurred", error_message)
@@ -334,20 +376,39 @@ class MainWindow(QMainWindow):
     def _process_text(self):
         print("Processing text...")
         full_text = self.text_area.toPlainText()
+        
+        self.sentences = []
+        self.sentence_spans = []
+        self.paragraph_sentence_map = []
+
         if not full_text:
-            self.sentences = []
-            self.sentence_spans = []
-            self.prev_sentence_button.setEnabled(False)
-            self.next_sentence_button.setEnabled(False)
+            self.stop_tts() # Disables the buttons
             return
         
-        spans = self.tokenizer.span_tokenize(full_text)
-        self.sentence_spans = list(spans)
+        self.sentence_spans = list(self.tokenizer.span_tokenize(full_text))
         self.sentences = [full_text[start:end] for start, end in self.sentence_spans]
-        print(f"Processed {len(self.sentences)} sentences.")
+
+        paragraphs = full_text.split('\n\n')
+
+        current_sentence_index = 0
+        for para in paragraphs:
+            para = para.strip()
+            if not para: continue
+
+            sentences_in_para = self.tokenizer.tokenize(para)
+            num_sentences = len(sentences_in_para)
+
+            if num_sentences > 0:
+                indices = list(range(current_sentence_index, current_sentence_index + num_sentences))
+                self.paragraph_sentence_map.append(indices)
+                current_sentence_index += num_sentences
+        
+        print(f"Processed {len(self.sentences)} sentences in {len(self.paragraph_sentence_map)} paragraphs.")
         self.current_sentence_index = 0
         self.prev_sentence_button.setEnabled(True)
         self.next_sentence_button.setEnabled(True)
+        self.prev_paragraph_button.setEnabled(True)
+        self.next_paragraph_button.setEnabled(True)
 
     def open_settings(self):
         dialog = SettingsDialog(self)
