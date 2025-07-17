@@ -86,6 +86,9 @@ class MainWindow(QMainWindow):
         
         self.playback_state = "STOPPED"
         
+        self.current_file_path = None
+        self.current_start_page = None
+        
         self.sentences = []
         self.sentence_spans = [] 
         self.paragraph_sentence_map = []
@@ -151,8 +154,10 @@ class MainWindow(QMainWindow):
         self.next_paragraph_button = QPushButton("Next Para >>")
         self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
+        self.fix_start_button = QPushButton("Fix Start")
 
         controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(self.fix_start_button)
         controls_layout.addWidget(self.prev_paragraph_button)
         controls_layout.addWidget(self.prev_sentence_button)
         controls_layout.addWidget(self.play_button)
@@ -168,6 +173,7 @@ class MainWindow(QMainWindow):
         self.next_sentence_button.clicked.connect(self.next_sentence)
         self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
         self.next_paragraph_button.clicked.connect(self.next_paragraph)
+        self.fix_start_button.clicked.connect(self.load_previous_page)
         
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
         self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
@@ -177,6 +183,7 @@ class MainWindow(QMainWindow):
         self.next_sentence_button.setEnabled(False)
         self.prev_paragraph_button.setEnabled(False)
         self.next_paragraph_button.setEnabled(False)
+        self.fix_start_button.setEnabled(False)
 
     def _apply_highlight(self, start, end, text_format):
         cursor = self.text_area.textCursor()
@@ -348,6 +355,16 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "An Azure TTS Error Occurred", error_message)
         self.stop_tts()
 
+    def load_previous_page(self):
+        if self.current_file_path == None: return
+        if self.current_start_page <= 0: return
+
+        new_start_page = self.current_start_page - 1
+        doc = fitz.open(self.current_file_path)
+        text = self._extract_text_from_pdf(doc, new_start_page)
+        self._process_text(text)
+        self.current_start_page = new_start_page
+    
     def open_file(self):
         if self.playback_state != "STOPPED": self.stop_tts()
         
@@ -359,82 +376,86 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
-
+        
+        self.current_file_path = file_path
+        
         content = ""
         try:
             if file_path.lower().endswith('.pdf'):
-                content = self._read_pdf(file_path)
+                with fitz.open(file_path) as doc:
+                    print(f"PDF has {len(doc)} pages.")
+                    self.current_start_page = self._detect_pdf_start_page(doc)
+                    content = self._extract_text_from_pdf(doc, self.current_start_page)
+                self.fix_start_button.setEnabled(True)
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-            
+                self.current_start_page = 0
             self._process_text(content)
         except Exception as e:
             QMessageBox.critical(self, "Error Reading File", f"Could not read the file.\n\nError: {e}")
 
-    def _read_pdf(self, file_path):
-        print(f"Reading PDF: {file_path}")
-        full_text = []
-        page_numbers = {} 
+    def _detect_pdf_start_page(self, doc):
         self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
+        toc_page_candidates = []
+        for page_num in range(min(15, len(doc))):
+            page = doc.load_page(page_num)
+            link_list = page.get_links()
 
-        with fitz.open(file_path) as doc:
-            print(f"PDF has {len(doc)} pages.")
-            
-            toc_page_candidates = []
-            for page_num in range(min(15, len(doc))):
-                page = doc.load_page(page_num)
-                link_list = page.get_links()
-
-                print(f"--- Page {page_num + 1} ---")
-                for link in link_list:
-                    link_text = page.get_text("text", clip=link['from'])
-                    
-                    print(f"Found a link: {link}")
-                    print(f"Its link text is {link_text}")
-
-                    for keyword in self.chapter_keywords:
-                        if keyword.lower() in link_text.lower():
-                            print(f"------> This link contains the keyword '{keyword}'.\n\n")
-                            toc_page_candidates.append(page_num)
-                            break
+            print(f"--- Page {page_num + 1} ---")
+            for link in link_list:
+                link_text = page.get_text("text", clip=link['from'])
                 
-            print(f"================== Table of content page candidates: {toc_page_candidates} =======================")
+                print(f"Found a link: {link}")
+                print(f"Its link text is {link_text}")
 
-            true_last_toc_page = -1
-            if toc_page_candidates:
-                true_last_toc_page = toc_page_candidates[0]
-
-                for i in range(1, len(toc_page_candidates)):
-                    if toc_page_candidates[i] == toc_page_candidates[i-1] + 1:
-                        true_last_toc_page = toc_page_candidates[i]
-                    else:
+                for keyword in self.chapter_keywords:
+                    if keyword.lower() in link_text.lower():
+                        print(f"------> This link contains the keyword '{keyword}'.\n\n")
+                        toc_page_candidates.append(page_num)
                         break
+            
+        print(f"================== Table of content page candidates: {toc_page_candidates} =======================")
 
-            print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
+        true_last_toc_page = -1
+        if toc_page_candidates:
+            true_last_toc_page = toc_page_candidates[0]
 
-            for page_num in range(true_last_toc_page + 1, len(doc)):
-                page = doc.load_page(page_num)
-                page_height = page.rect.height
-                footer_margin = page_height * 0.90
-                
-                blocks = page.get_text("blocks")
-                for block in blocks:
-                    if block[6] == 0: 
-                        block_y_pos = block[1]
-                        block_text = block[4].strip()
+            for i in range(1, len(toc_page_candidates)):
+                if toc_page_candidates[i] == toc_page_candidates[i-1] + 1:
+                    true_last_toc_page = toc_page_candidates[i]
+                else:
+                    break
 
-                        if block_y_pos > footer_margin:
-                            found_numbers = re.findall(r'\d+', block_text)
-                            if found_numbers:
-                                page_numbers[page_num + 1] = int(found_numbers[0])
-                                print(f"Found and skipped footer on page {page_num + 1}: '{block_text}'")
-                                continue 
-                        
-                        full_text.append(block_text)
-        
+        print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
+        return true_last_toc_page + 1
+
+    def _extract_text_from_pdf(self, doc, start_page):
+        full_text = []
+        page_numbers = {}
+
+        for page_num in range(start_page, len(doc)):
+            page = doc.load_page(page_num)
+            page_height = page.rect.height
+            footer_margin = page_height * 0.90
+            
+            blocks = page.get_text("blocks")
+            for block in blocks:
+                if block[6] == 0: 
+                    block_y_pos = block[1]
+                    block_text = block[4].strip()
+
+                    if block_y_pos > footer_margin:
+                        found_numbers = re.findall(r'\d+', block_text)
+                        if found_numbers:
+                            page_numbers[page_num + 1] = int(found_numbers[0])
+                            print(f"Found and skipped footer on page {page_num + 1}: '{block_text}'")
+                            continue 
+                    
+                    full_text.append(block_text)
+    
         print(f"Extracted page numbers: {page_numbers}")
-        return "\n".join(full_text)
+        return "\n".join(full_text)            
 
     def _process_text(self, raw_text):
         print("Processing text...")
