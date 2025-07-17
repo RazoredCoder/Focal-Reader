@@ -89,6 +89,7 @@ class MainWindow(QMainWindow):
         self.current_file_path = None
         self.current_start_page = None
         
+        self.toc_pages = []
         self.sentences = []
         self.sentence_spans = [] 
         self.paragraph_sentence_map = []
@@ -384,8 +385,10 @@ class MainWindow(QMainWindow):
             if file_path.lower().endswith('.pdf'):
                 with fitz.open(file_path) as doc:
                     print(f"PDF has {len(doc)} pages.")
-                    self.current_start_page = self._detect_pdf_start_page(doc)
+                    toc_destinations, self.current_start_page = self._parse_toc_links(doc)
+
                     content = self._extract_text_from_pdf(doc, self.current_start_page)
+                    print(f"======>>>>> This is the TOC destinations dictionary: {toc_destinations}")
                 self.fix_start_button.setEnabled(True)
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -395,7 +398,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error Reading File", f"Could not read the file.\n\nError: {e}")
 
-    def _detect_pdf_start_page(self, doc):
+    def _parse_toc_links(self, doc):
         self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
         toc_page_candidates = []
         for page_num in range(min(15, len(doc))):
@@ -416,17 +419,54 @@ class MainWindow(QMainWindow):
                         break
             
         print(f"================== Table of content page candidates: {toc_page_candidates} =======================")
+        first_page = self._detect_pdf_start_page(toc_page_candidates)
+        if not first_page:
+            return [], 0 # Return an empty list and page 0 as defaults
+        
+        toc_destinations = []
+        for page_num in self.toc_pages:
+            page = doc.load_page(page_num)
+            link_list = page.get_links()
 
+            for link in link_list:
+                link_text = page.get_text("text", clip=link['from'])
+                
+                is_a_real_toc_entry = False
+                for keyword in self.chapter_keywords:
+                    if keyword.lower() in link_text.lower():
+                        is_a_real_toc_entry = True
+                        break
+                
+                if is_a_real_toc_entry:
+                    temp_link_dict = {}
+                    temp_link_dict['text'] = link_text.strip()
+                    temp_link_dict['dest_page'] = link['page']
+                    toc_destinations.append(temp_link_dict)
+
+        return toc_destinations, first_page
+        
+    
+    def _detect_pdf_start_page(self, candidates):
+        toc_page_candidates = candidates
+        
         true_last_toc_page = -1
-        if toc_page_candidates:
-            true_last_toc_page = toc_page_candidates[0]
+        true_toc_pages = []
+        
+        unique_candidates = sorted(list(set(toc_page_candidates)))
+        if unique_candidates:
+            first_toc_page = unique_candidates[0]
+            true_toc_pages.append(first_toc_page)
+            true_last_toc_page = first_toc_page
 
-            for i in range(1, len(toc_page_candidates)):
-                if toc_page_candidates[i] == toc_page_candidates[i-1] + 1:
-                    true_last_toc_page = toc_page_candidates[i]
+            for i in range (1, len(unique_candidates)):
+                if unique_candidates[i] == unique_candidates[i-1] + 1:
+                    true_toc_pages.append(unique_candidates[i])
+                    true_last_toc_page = unique_candidates[i]
+                
                 else:
                     break
-
+        self.toc_pages = true_toc_pages
+        print(f"================== The true TOC pages are: {self.toc_pages} =======================")
         print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
         return true_last_toc_page + 1
 
