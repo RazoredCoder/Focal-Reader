@@ -376,10 +376,45 @@ class MainWindow(QMainWindow):
         print(f"Reading PDF: {file_path}")
         full_text = []
         page_numbers = {} 
+        self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
 
         with fitz.open(file_path) as doc:
             print(f"PDF has {len(doc)} pages.")
-            for page_num, page in enumerate(doc):
+            
+            toc_page_candidates = []
+            for page_num in range(min(15, len(doc))):
+                page = doc.load_page(page_num)
+                link_list = page.get_links()
+
+                print(f"--- Page {page_num + 1} ---")
+                for link in link_list:
+                    link_text = page.get_text("text", clip=link['from'])
+                    
+                    print(f"Found a link: {link}")
+                    print(f"Its link text is {link_text}")
+
+                    for keyword in self.chapter_keywords:
+                        if keyword.lower() in link_text.lower():
+                            print(f"------> This link contains the keyword '{keyword}'.\n\n")
+                            toc_page_candidates.append(page_num)
+                            break
+                
+            print(f"================== Table of content page candidates: {toc_page_candidates} =======================")
+
+            true_last_toc_page = -1
+            if toc_page_candidates:
+                true_last_toc_page = toc_page_candidates[0]
+
+                for i in range(1, len(toc_page_candidates)):
+                    if toc_page_candidates[i] == toc_page_candidates[i-1] + 1:
+                        true_last_toc_page = toc_page_candidates[i]
+                    else:
+                        break
+
+            print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
+
+            for page_num in range(true_last_toc_page + 1, len(doc)):
+                page = doc.load_page(page_num)
                 page_height = page.rect.height
                 footer_margin = page_height * 0.90
                 
@@ -399,14 +434,11 @@ class MainWindow(QMainWindow):
                         full_text.append(block_text)
         
         print(f"Extracted page numbers: {page_numbers}")
-        # Join with single newlines to preserve all potential paragraph breaks
         return "\n".join(full_text)
 
-    # --- MODIFIED: The definitive text processing method ---
     def _process_text(self, raw_text):
         print("Processing text...")
         
-        # Reset all data structures
         self.sentences = []
         self.sentence_spans = []
         self.paragraph_sentence_map = []
@@ -416,13 +448,12 @@ class MainWindow(QMainWindow):
             self.stop_tts()
             return
 
-        # Part 1: Text Cleaning (As per your instructions)
-        chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword']
+        # Part 1: Text Cleaning
         para_break_placeholder = " [PARA_BREAK] "
         
         processed_text = raw_text.replace('\n\n', para_break_placeholder)
         
-        for keyword in chapter_keywords:
+        for keyword in self.chapter_keywords:
             processed_text = re.sub(r'\n\s*(' + keyword + r'(\s+\d+)?)', rf'{para_break_placeholder}\1', processed_text, flags=re.IGNORECASE)
 
         raw_sentence_spans = list(self.tokenizer.span_tokenize(processed_text))
@@ -449,12 +480,10 @@ class MainWindow(QMainWindow):
         self.text_area.setText(final_text)
 
         # --- Part 2: Analyze the final, clean text to build the navigation maps ---
-        # This corrected version uses a single source of truth to avoid mapping errors.
 
         full_text_for_analysis = self.text_area.toPlainText()
 
         # 2a. Get the master list of sentences and their character positions (spans).
-        # This is our single source of truth.
         self.sentence_spans = list(self.tokenizer.span_tokenize(full_text_for_analysis))
         self.sentences = [full_text_for_analysis[start:end] for start, end in self.sentence_spans]
 
@@ -469,8 +498,6 @@ class MainWindow(QMainWindow):
         for i, (start, end) in enumerate(self.sentence_spans):
             current_paragraph_indices.append(i)
 
-            # A paragraph break is determined by finding "\n\n" between this sentence 
-            # and the next, or by reaching the end of the document.
             is_last_sentence = (i == len(self.sentence_spans) - 1)
 
             # Define the region of text to check for a paragraph break.
@@ -485,12 +512,12 @@ class MainWindow(QMainWindow):
             # If we find a double newline or it's the last sentence, this paragraph is complete.
             if "\n\n" in intervening_text or is_last_sentence:
                 self.paragraph_sentence_map.append(current_paragraph_indices)
-                current_paragraph_indices = [] # Reset for the next paragraph.
+                current_paragraph_indices = []
 
         # --- Finalization ---
         print(f"Processed {len(self.sentences)} sentences in {len(self.paragraph_sentence_map)} paragraphs.")
         self.current_sentence_index = 0
-        nav_enabled = bool(self.sentences) # More Pythonic way to set the flag
+        nav_enabled = bool(self.sentences)
         self.prev_sentence_button.setEnabled(nav_enabled)
         self.next_sentence_button.setEnabled(nav_enabled)
         self.prev_paragraph_button.setEnabled(nav_enabled)
