@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit,
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from settings_dialog import SettingsDialog
+from emergency_dialog import EmergencyDialog
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
@@ -88,6 +89,13 @@ class MainWindow(QMainWindow):
         
         self.current_file_path = None
         self.current_start_page = None
+
+        self.footer_patterns = [
+            # Pattern 1: For footers like "Page 1 Goldenagato | mp4directs.com"
+            re.compile(r'^Page\s+\d+', re.IGNORECASE),
+            # Pattern 2: For footers like "11 | P a g e"
+            re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE),
+        ]
         
         self.toc_pages = []
         self.sentences = []
@@ -156,9 +164,11 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
         self.fix_start_button = QPushButton("Fix Start")
+        self.emergency_button = QPushButton("Emergency Menu")
 
         controls_layout.addWidget(self.load_button)
-        controls_layout.addWidget(self.fix_start_button)
+        controls_layout.addWidget(self.emergency_button)
+        # controls_layout.addWidget(self.fix_start_button)
         controls_layout.addWidget(self.prev_paragraph_button)
         controls_layout.addWidget(self.prev_sentence_button)
         controls_layout.addWidget(self.play_button)
@@ -175,6 +185,7 @@ class MainWindow(QMainWindow):
         self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
         self.next_paragraph_button.clicked.connect(self.next_paragraph)
         self.fix_start_button.clicked.connect(self.load_previous_page)
+        self.emergency_button.clicked.connect(self.open_emergency_menu)
         
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
         self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
@@ -185,6 +196,7 @@ class MainWindow(QMainWindow):
         self.prev_paragraph_button.setEnabled(False)
         self.next_paragraph_button.setEnabled(False)
         self.fix_start_button.setEnabled(False)
+        self.emergency_button.setEnabled(False)
 
     def _apply_highlight(self, start, end, text_format):
         cursor = self.text_area.textCursor()
@@ -390,6 +402,7 @@ class MainWindow(QMainWindow):
                     content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
                     print(f"======>>>>> This is the TOC destinations dictionary: {self.toc_destinations}")
                 self.fix_start_button.setEnabled(True)
+                self.emergency_button.setEnabled(True)
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -469,11 +482,23 @@ class MainWindow(QMainWindow):
         print(f"================== The true TOC pages are: {self.toc_pages} =======================")
         print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
         return true_last_toc_page + 1
+    
+    def _is_block_a_footer(self, block_text, y_pos, page_height):
+        for pattern in self.footer_patterns:
+            if pattern.search(block_text):
+                return True
+            
+        if y_pos > (page_height * 0.90):
+            if re.search(r'\d', block_text):
+                return True
+        
+        return False
 
     def _extract_text_from_pdf(self, doc, start_page, toc_destinations):
         full_text = []
-        page_numbers = {}
         skip_next_page = False
+        para_break_placeholder = " [PARA_BREAK] "
+
 
         for page_num in range(start_page, len(doc)):
             if skip_next_page:
@@ -481,23 +506,23 @@ class MainWindow(QMainWindow):
                 continue
             
             page = doc.load_page(page_num)
-            
+            page_height = page.rect.height
             # Helper function to get a clean list of text strings from a page's blocks.
             def get_content_text_list(p):
-                page_height = p.rect.height
-                footer_margin = page_height * 0.90
-                
                 text_list = []
                 raw_blocks = p.get_text("blocks")
                 for block in raw_blocks:
                     if block[6] in [0, 1]: 
-                        block_text = block[4]
+                        block_text = block[4].strip()
+                        y_pos = block[1]
                         
-                        if "page" in block_text.lower() and len(block_text) < 100:
-                            print(f"Found and skipped footer on page {p.number + 1}: '{block_text.strip()}'")
+                        if self._is_block_a_footer(block_text, y_pos, page_height):
+                            print(f"Found and skipped footer on page {p.number + 1}: '{block_text}")
                             continue
+
+                        if block_text:
+                            text_list.append(block_text)
                         
-                        text_list.append(block[4].strip())
                 return text_list
 
             page_content_text = get_content_text_list(page)
@@ -511,7 +536,6 @@ class MainWindow(QMainWindow):
             if chapter_title_for_this_page and not page_content_text:
                 if (page_num + 1) < len(doc):
                     next_page = doc.load_page(page_num + 1)
-                    # Overwrite the empty list with content from the next page.
                     page_content_text = get_content_text_list(next_page)
                     skip_next_page = True
 
@@ -537,13 +561,12 @@ class MainWindow(QMainWindow):
                 print("---------------------------------\n")
                 # --- END OF DEBUG BLOCK ---
 
-                # This is the corrected logic
                 if cleaned_top_block not in cleaned_toc_title:
                     page_content_text.insert(0, chapter_title_for_this_page.strip())
             
             full_text.extend(page_content_text)
         
-        return "\n".join(full_text)            
+        return para_break_placeholder.join(full_text)            
 
     def _process_text(self, raw_text):
         print("Processing text...")
@@ -632,6 +655,32 @@ class MainWindow(QMainWindow):
         self.prev_paragraph_button.setEnabled(nav_enabled)
         self.next_paragraph_button.setEnabled(nav_enabled)
 
+    def open_emergency_menu(self):
+        dialog = EmergencyDialog(self)
+
+        dialog.fix_start_requested.connect(self.load_previous_page)
+        dialog.new_footer_requested.connect(self.add_and_reprocess_footer)
+
+        dialog.exec()
+
+    def add_and_reprocess_footer(self, footer_text):
+        new_pattern = re.compile(re.escape(footer_text), re.IGNORECASE)
+
+        self.footer_patterns.append(new_pattern)
+        self.reprocess_current_file()
+
+    def reprocess_current_file(self):
+        if not self.current_file_path:
+            return
+        
+        print("Re-processing current file with the new settings...")
+        try:
+            with fitz.open(self.current_file_path) as doc:
+                content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
+                self._process_text(content)
+        except Exception as e:
+            QMessageBox.critical(self, "Error Re-processing File", f"Could not re-read the file. \n\nError: {e}")
+    
     def open_settings(self):
         dialog = SettingsDialog(self)
         key, region = self.load_settings()
