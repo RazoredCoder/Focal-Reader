@@ -362,7 +362,7 @@ class MainWindow(QMainWindow):
 
         new_start_page = self.current_start_page - 1
         doc = fitz.open(self.current_file_path)
-        text = self._extract_text_from_pdf(doc, new_start_page)
+        text = self._extract_text_from_pdf(doc, new_start_page, self.toc_destinations)
         self._process_text(text)
         self.current_start_page = new_start_page
     
@@ -385,10 +385,10 @@ class MainWindow(QMainWindow):
             if file_path.lower().endswith('.pdf'):
                 with fitz.open(file_path) as doc:
                     print(f"PDF has {len(doc)} pages.")
-                    toc_destinations, self.current_start_page = self._parse_toc_links(doc)
+                    self.toc_destinations, self.current_start_page = self._parse_toc_links(doc)
 
-                    content = self._extract_text_from_pdf(doc, self.current_start_page)
-                    print(f"======>>>>> This is the TOC destinations dictionary: {toc_destinations}")
+                    content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
+                    print(f"======>>>>> This is the TOC destinations dictionary: {self.toc_destinations}")
                 self.fix_start_button.setEnabled(True)
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -470,31 +470,79 @@ class MainWindow(QMainWindow):
         print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
         return true_last_toc_page + 1
 
-    def _extract_text_from_pdf(self, doc, start_page):
+    def _extract_text_from_pdf(self, doc, start_page, toc_destinations):
         full_text = []
         page_numbers = {}
+        skip_next_page = False
 
         for page_num in range(start_page, len(doc)):
-            page = doc.load_page(page_num)
-            page_height = page.rect.height
-            footer_margin = page_height * 0.90
+            if skip_next_page:
+                skip_next_page = False
+                continue
             
-            blocks = page.get_text("blocks")
-            for block in blocks:
-                if block[6] == 0: 
-                    block_y_pos = block[1]
-                    block_text = block[4].strip()
+            page = doc.load_page(page_num)
+            
+            # Helper function to get a clean list of text strings from a page's blocks.
+            def get_content_text_list(p):
+                page_height = p.rect.height
+                footer_margin = page_height * 0.90
+                
+                text_list = []
+                raw_blocks = p.get_text("blocks")
+                for block in raw_blocks:
+                    if block[6] in [0, 1]: 
+                        block_text = block[4]
+                        
+                        if "page" in block_text.lower() and len(block_text) < 100:
+                            print(f"Found and skipped footer on page {p.number + 1}: '{block_text.strip()}'")
+                            continue
+                        
+                        text_list.append(block[4].strip())
+                return text_list
 
-                    if block_y_pos > footer_margin:
-                        found_numbers = re.findall(r'\d+', block_text)
-                        if found_numbers:
-                            page_numbers[page_num + 1] = int(found_numbers[0])
-                            print(f"Found and skipped footer on page {page_num + 1}: '{block_text}'")
-                            continue 
-                    
-                    full_text.append(block_text)
-    
-        print(f"Extracted page numbers: {page_numbers}")
+            page_content_text = get_content_text_list(page)
+
+            chapter_title_for_this_page = None
+            for toc_entry in toc_destinations:
+                if toc_entry['dest_page'] == page_num:
+                    chapter_title_for_this_page = toc_entry['text']
+                    break
+            
+            if chapter_title_for_this_page and not page_content_text:
+                if (page_num + 1) < len(doc):
+                    next_page = doc.load_page(page_num + 1)
+                    # Overwrite the empty list with content from the next page.
+                    page_content_text = get_content_text_list(next_page)
+                    skip_next_page = True
+
+
+            if chapter_title_for_this_page:
+                top_block_text = ""
+                if page_content_text:
+                    top_block_text = page_content_text[0]
+
+                cleaned_top_block = top_block_text.replace('\n', ' ').strip().lower()
+                cleaned_toc_title = chapter_title_for_this_page.strip().lower()
+
+                # --- START OF DEBUG BLOCK ---
+                print(f"\n----- TITLE CHECK ON PAGE {page_num} -----")
+                print(f"Cleaned TOC Title: '{cleaned_toc_title}'")
+                print(f"Cleaned Top Block: '{cleaned_top_block}'")
+                
+                is_missing_currently = cleaned_toc_title not in cleaned_top_block
+                print(f"  -> Is title missing (our current, flawed logic)? {is_missing_currently}")
+
+                is_missing_correctly = cleaned_top_block not in cleaned_toc_title
+                print(f"  -> Is title missing (the correct logic)? {is_missing_correctly}")
+                print("---------------------------------\n")
+                # --- END OF DEBUG BLOCK ---
+
+                # This is the corrected logic
+                if cleaned_top_block not in cleaned_toc_title:
+                    page_content_text.insert(0, chapter_title_for_this_page.strip())
+            
+            full_text.extend(page_content_text)
+        
         return "\n".join(full_text)            
 
     def _process_text(self, raw_text):
