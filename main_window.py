@@ -562,9 +562,10 @@ class MainWindow(QMainWindow):
         return cleaned_text.strip()
 
     def _extract_text_from_pdf(self, doc, start_page, toc_destinations):
-        full_text = []
+        full_text_parts = []
         skip_next_page = False
         para_break_placeholder = " [PARA_BREAK] "
+        toc_titles = {entry['text'].strip() for entry in toc_destinations}
 
 
         for page_num in range(start_page, len(doc)):
@@ -633,9 +634,18 @@ class MainWindow(QMainWindow):
                 if cleaned_top_block not in cleaned_toc_title:
                     page_content_text.insert(0, chapter_title_for_this_page.strip())
             
-            full_text.extend(page_content_text)
-        
-        return para_break_placeholder.join(full_text)            
+            full_text_parts.extend(page_content_text)
+
+        final_text = ""
+        for i, part in enumerate(full_text_parts):
+            final_text += part
+            if part.strip() in toc_titles:
+                final_text += "\n\n"
+            else:
+                if i < len(full_text_parts) - 1:
+                    final_text += "\n"
+
+        return final_text            
 
     def _process_text(self, raw_text):
         print("Processing text...")
@@ -648,6 +658,9 @@ class MainWindow(QMainWindow):
             self.text_area.setText("")
             self.stop_tts()
             return
+
+        combined_pattern_str = r'([^\.\?!])\s*\n(?=(?:' + '|'.join(self.chapter_keywords) + r'))'
+        raw_text = re.sub(combined_pattern_str, r'\1.\n', raw_text, flags=re.IGNORECASE)
 
         # Part 1: Text Cleaning
         para_break_placeholder = " [PARA_BREAK] "
