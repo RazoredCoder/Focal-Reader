@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit,
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from settings_dialog import SettingsDialog
+from emergency_dialog import EmergencyDialog
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
@@ -88,6 +89,13 @@ class MainWindow(QMainWindow):
         
         self.current_file_path = None
         self.current_start_page = None
+
+        self.footer_patterns = [
+            # Pattern 1: For footers like "Page 1 Goldenagato | mp4directs.com"
+            re.compile(r'^Page\s+\d+', re.IGNORECASE),
+            # Pattern 2: For footers like "11 | P a g e"
+            re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE),
+        ]
         
         self.toc_pages = []
         self.sentences = []
@@ -156,9 +164,11 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
         self.fix_start_button = QPushButton("Fix Start")
+        self.emergency_button = QPushButton("Emergency Menu")
 
         controls_layout.addWidget(self.load_button)
-        controls_layout.addWidget(self.fix_start_button)
+        controls_layout.addWidget(self.emergency_button)
+        # controls_layout.addWidget(self.fix_start_button)
         controls_layout.addWidget(self.prev_paragraph_button)
         controls_layout.addWidget(self.prev_sentence_button)
         controls_layout.addWidget(self.play_button)
@@ -175,6 +185,7 @@ class MainWindow(QMainWindow):
         self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
         self.next_paragraph_button.clicked.connect(self.next_paragraph)
         self.fix_start_button.clicked.connect(self.load_previous_page)
+        self.emergency_button.clicked.connect(self.open_emergency_menu)
         
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
         self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
@@ -185,6 +196,7 @@ class MainWindow(QMainWindow):
         self.prev_paragraph_button.setEnabled(False)
         self.next_paragraph_button.setEnabled(False)
         self.fix_start_button.setEnabled(False)
+        self.emergency_button.setEnabled(False)
 
     def _apply_highlight(self, start, end, text_format):
         cursor = self.text_area.textCursor()
@@ -362,7 +374,7 @@ class MainWindow(QMainWindow):
 
         new_start_page = self.current_start_page - 1
         doc = fitz.open(self.current_file_path)
-        text = self._extract_text_from_pdf(doc, new_start_page)
+        text = self._extract_text_from_pdf(doc, new_start_page, self.toc_destinations)
         self._process_text(text)
         self.current_start_page = new_start_page
     
@@ -385,11 +397,12 @@ class MainWindow(QMainWindow):
             if file_path.lower().endswith('.pdf'):
                 with fitz.open(file_path) as doc:
                     print(f"PDF has {len(doc)} pages.")
-                    toc_destinations, self.current_start_page = self._parse_toc_links(doc)
+                    self.toc_destinations, self.current_start_page = self._parse_toc_links(doc)
 
-                    content = self._extract_text_from_pdf(doc, self.current_start_page)
-                    print(f"======>>>>> This is the TOC destinations dictionary: {toc_destinations}")
+                    content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
+                    print(f"======>>>>> This is the TOC destinations dictionary: {self.toc_destinations}")
                 self.fix_start_button.setEnabled(True)
+                self.emergency_button.setEnabled(True)
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -400,48 +413,110 @@ class MainWindow(QMainWindow):
 
     def _parse_toc_links(self, doc):
         self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
-        toc_page_candidates = []
+
+        raw_links = []
+        has_empty_links = False
         for page_num in range(min(15, len(doc))):
             page = doc.load_page(page_num)
             link_list = page.get_links()
 
             print(f"--- Page {page_num + 1} ---")
             for link in link_list:
-                link_text = page.get_text("text", clip=link['from'])
+                link_text = page.get_text("text", clip=link['from']).strip()
+                if not link_text:
+                    has_empty_links = True
+                raw_links.append({'link_obj': link, 'text': link_text, 'source_page': page_num})
                 
                 print(f"Found a link: {link}")
                 print(f"Its link text is {link_text}")
 
-                for keyword in self.chapter_keywords:
-                    if keyword.lower() in link_text.lower():
-                        print(f"------> This link contains the keyword '{keyword}'.\n\n")
+        toc_page_candidates = []
+
+        if has_empty_links:
+            print("DEBUG: Empty links detected. Using full-page text analysis to find TOC.")
+
+            toc_keyword_pattern = re.compile('|'.join(self.chapter_keywords), re.IGNORECASE)
+            for page_num in range(min(15, len(doc))):
+                if any(link['source_page'] == page_num for link in raw_links):
+                    page_text = doc.load_page(page_num).get_text().lower()
+                    matches = toc_keyword_pattern.findall(page_text)
+                    occurrence_count = len(matches)
+
+                    print(f"DEBUG: Page {page_num} has {occurrence_count} keyword occurrences.")
+
+                    if occurrence_count > 4:
                         toc_page_candidates.append(page_num)
+        
+        else:
+            print("DEBUG: Standard links detected. Using link text analysis to find TOC.")
+            for link_data in raw_links:
+                for keyword in self.chapter_keywords:
+                    if keyword in link_data['text'].lower():
+                        if link_data['source_page'] not in toc_page_candidates:
+                            toc_page_candidates.append(link_data['source_page'])
                         break
-            
+        
         print(f"================== Table of content page candidates: {toc_page_candidates} =======================")
+
         first_page = self._detect_pdf_start_page(toc_page_candidates)
         if not first_page:
-            return [], 0 # Return an empty list and page 0 as defaults
+            return [], 0
         
         toc_destinations = []
-        for page_num in self.toc_pages:
-            page = doc.load_page(page_num)
-            link_list = page.get_links()
+        
+        if has_empty_links and self.toc_pages:
 
-            for link in link_list:
-                link_text = page.get_text("text", clip=link['from'])
+            try:
+                print("DEBUG: Attempting to parse TOC from text block...")
+                toc_text_block = ""
+                for page_num in self.toc_pages:
+                    page = doc.load_page(page_num)
+                    toc_text_block += self._clean_text_of_footers(page.get_text())
                 
-                is_a_real_toc_entry = False
-                for keyword in self.chapter_keywords:
-                    if keyword.lower() in link_text.lower():
-                        is_a_real_toc_entry = True
-                        break
+                all_titles = re.split(r'(?<=[a-z?!])(?=[A-Z])', toc_text_block)
+                all_titles = [title.strip() for title in all_titles if "Table of Contents" not in title and title.strip()]
                 
-                if is_a_real_toc_entry:
-                    temp_link_dict = {}
-                    temp_link_dict['text'] = link_text.strip()
-                    temp_link_dict['dest_page'] = link['page']
-                    toc_destinations.append(temp_link_dict)
+                toc_links_on_pages = [link['link_obj'] for link in raw_links if link['source_page'] in self.toc_pages]
+                
+                unique_links = []
+                seen_pages_for_links = set()
+                for link_obj in toc_links_on_pages:
+                    dest_page = link_obj['page']
+                    if dest_page not in seen_pages_for_links:
+                        unique_links.append(link_obj)
+                        seen_pages_for_links.add(dest_page)
+                
+                all_toc_pairs = zip(all_titles, unique_links)
+
+                toc_destinations = []
+                seen_pages = set()
+                for title, link_obj in all_toc_pairs:
+                    dest_page = link_obj['page']
+                    if dest_page in seen_pages:
+                        continue
+                    
+                    for keyword in self.chapter_keywords:
+                        if keyword in title.lower():
+                            toc_destinations.append({
+                                'text': title,
+                                'dest_page': dest_page
+                            })
+                            seen_pages.add(dest_page)
+                            break
+
+            except Exception as e:
+                print(f"ERROR: Special TOC parsing failed: {e}")
+        
+        if not toc_destinations:
+            for link_data in raw_links:
+                if link_data['source_page'] in self.toc_pages:
+                    for keyword in self.chapter_keywords:
+                        if keyword.lower() in link_data['text'].lower():
+                            toc_destinations.append({
+                                'text': link_data['text'].replace('\n', ' ').strip(),
+                                'dest_page': link_data['link_obj']['page']
+                            })
+                            break
 
         return toc_destinations, first_page
         
@@ -470,32 +545,97 @@ class MainWindow(QMainWindow):
         print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
         return true_last_toc_page + 1
 
-    def _extract_text_from_pdf(self, doc, start_page):
+    def _should_skip_block(self, block_text, y_pos, page_height):
+        if y_pos > (page_height * 0.9) and len(block_text) < 100:
+            for keyword in self.chapter_keywords:
+                if keyword in block_text.lower():
+                    return False
+            
+            if re.search(r'\d', block_text):
+                return True
+            return False
+        
+    def _clean_text_of_footers(self, block_text):
+        cleaned_text = block_text
+        for pattern in self.footer_patterns:
+            cleaned_text = pattern.sub('', cleaned_text)
+        return cleaned_text.strip()
+
+    def _extract_text_from_pdf(self, doc, start_page, toc_destinations):
         full_text = []
-        page_numbers = {}
+        skip_next_page = False
+        para_break_placeholder = " [PARA_BREAK] "
+
 
         for page_num in range(start_page, len(doc)):
+            if skip_next_page:
+                skip_next_page = False
+                continue
+            
             page = doc.load_page(page_num)
             page_height = page.rect.height
-            footer_margin = page_height * 0.90
-            
-            blocks = page.get_text("blocks")
-            for block in blocks:
-                if block[6] == 0: 
-                    block_y_pos = block[1]
-                    block_text = block[4].strip()
+            # Helper function to get a clean list of text strings from a page's blocks.
+            def get_content_text_list(p):
+                text_list = []
+                raw_blocks = p.get_text("blocks")
+                for block in raw_blocks:
+                    if block[6] in [0, 1]: 
+                        block_text = block[4].strip()
+                        y_pos = block[1]
+                        
+                        if self._should_skip_block(block_text, y_pos, p.rect.height):
+                            print(f"Skipped isolated footer on page {p.number + 1}: '{block_text.strip()}")
+                            continue
 
-                    if block_y_pos > footer_margin:
-                        found_numbers = re.findall(r'\d+', block_text)
-                        if found_numbers:
-                            page_numbers[page_num + 1] = int(found_numbers[0])
-                            print(f"Found and skipped footer on page {page_num + 1}: '{block_text}'")
-                            continue 
-                    
-                    full_text.append(block_text)
-    
-        print(f"Extracted page numbers: {page_numbers}")
-        return "\n".join(full_text)            
+                        cleaned_text = self._clean_text_of_footers(block_text)
+
+                        if cleaned_text:
+                            text_list.append(cleaned_text)
+                        
+                return text_list
+
+            page_content_text = get_content_text_list(page)
+
+            chapter_title_for_this_page = None
+            for toc_entry in toc_destinations:
+                if toc_entry['dest_page'] == page_num:
+                    chapter_title_for_this_page = toc_entry['text']
+                    break
+            
+            if chapter_title_for_this_page and not page_content_text:
+                if (page_num + 1) < len(doc):
+                    next_page = doc.load_page(page_num + 1)
+                    page_content_text = get_content_text_list(next_page)
+                    skip_next_page = True
+
+
+            if chapter_title_for_this_page:
+                top_block_text = ""
+                if page_content_text:
+                    top_block_text = page_content_text[0]
+
+                cleaned_top_block = top_block_text.replace('\n', ' ').replace(' ', '').lower()
+                cleaned_toc_title = chapter_title_for_this_page.replace('\n', ' ').replace(' ', '').lower()
+
+                # --- START OF DEBUG BLOCK ---
+                print(f"\n----- TITLE CHECK ON PAGE {page_num} -----")
+                print(f"Cleaned TOC Title: '{cleaned_toc_title}'")
+                print(f"Cleaned Top Block: '{cleaned_top_block}'")
+                
+                is_missing_currently = cleaned_toc_title not in cleaned_top_block
+                print(f"  -> Is title missing (our current, flawed logic)? {is_missing_currently}")
+
+                is_missing_correctly = cleaned_top_block not in cleaned_toc_title
+                print(f"  -> Is title missing (the correct logic)? {is_missing_correctly}")
+                print("---------------------------------\n")
+                # --- END OF DEBUG BLOCK ---
+
+                if cleaned_top_block not in cleaned_toc_title:
+                    page_content_text.insert(0, chapter_title_for_this_page.strip())
+            
+            full_text.extend(page_content_text)
+        
+        return para_break_placeholder.join(full_text)            
 
     def _process_text(self, raw_text):
         print("Processing text...")
@@ -584,6 +724,32 @@ class MainWindow(QMainWindow):
         self.prev_paragraph_button.setEnabled(nav_enabled)
         self.next_paragraph_button.setEnabled(nav_enabled)
 
+    def open_emergency_menu(self):
+        dialog = EmergencyDialog(self)
+
+        dialog.fix_start_requested.connect(self.load_previous_page)
+        dialog.new_footer_requested.connect(self.add_and_reprocess_footer)
+
+        dialog.exec()
+
+    def add_and_reprocess_footer(self, footer_text):
+        new_pattern = re.compile(re.escape(footer_text), re.IGNORECASE)
+
+        self.footer_patterns.append(new_pattern)
+        self.reprocess_current_file()
+
+    def reprocess_current_file(self):
+        if not self.current_file_path:
+            return
+        
+        print("Re-processing current file with the new settings...")
+        try:
+            with fitz.open(self.current_file_path) as doc:
+                content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
+                self._process_text(content)
+        except Exception as e:
+            QMessageBox.critical(self, "Error Re-processing File", f"Could not re-read the file. \n\nError: {e}")
+    
     def open_settings(self):
         dialog = SettingsDialog(self)
         key, region = self.load_settings()
