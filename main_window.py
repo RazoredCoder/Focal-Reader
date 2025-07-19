@@ -413,48 +413,110 @@ class MainWindow(QMainWindow):
 
     def _parse_toc_links(self, doc):
         self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
-        toc_page_candidates = []
+
+        raw_links = []
+        has_empty_links = False
         for page_num in range(min(15, len(doc))):
             page = doc.load_page(page_num)
             link_list = page.get_links()
 
             print(f"--- Page {page_num + 1} ---")
             for link in link_list:
-                link_text = page.get_text("text", clip=link['from'])
+                link_text = page.get_text("text", clip=link['from']).strip()
+                if not link_text:
+                    has_empty_links = True
+                raw_links.append({'link_obj': link, 'text': link_text, 'source_page': page_num})
                 
                 print(f"Found a link: {link}")
                 print(f"Its link text is {link_text}")
 
-                for keyword in self.chapter_keywords:
-                    if keyword.lower() in link_text.lower():
-                        print(f"------> This link contains the keyword '{keyword}'.\n\n")
+        toc_page_candidates = []
+
+        if has_empty_links:
+            print("DEBUG: Empty links detected. Using full-page text analysis to find TOC.")
+
+            toc_keyword_pattern = re.compile('|'.join(self.chapter_keywords), re.IGNORECASE)
+            for page_num in range(min(15, len(doc))):
+                if any(link['source_page'] == page_num for link in raw_links):
+                    page_text = doc.load_page(page_num).get_text().lower()
+                    matches = toc_keyword_pattern.findall(page_text)
+                    occurrence_count = len(matches)
+
+                    print(f"DEBUG: Page {page_num} has {occurrence_count} keyword occurrences.")
+
+                    if occurrence_count > 4:
                         toc_page_candidates.append(page_num)
+        
+        else:
+            print("DEBUG: Standard links detected. Using link text analysis to find TOC.")
+            for link_data in raw_links:
+                for keyword in self.chapter_keywords:
+                    if keyword in link_data['text'].lower():
+                        if link_data['source_page'] not in toc_page_candidates:
+                            toc_page_candidates.append(link_data['source_page'])
                         break
-            
+        
         print(f"================== Table of content page candidates: {toc_page_candidates} =======================")
+
         first_page = self._detect_pdf_start_page(toc_page_candidates)
         if not first_page:
-            return [], 0 # Return an empty list and page 0 as defaults
+            return [], 0
         
         toc_destinations = []
-        for page_num in self.toc_pages:
-            page = doc.load_page(page_num)
-            link_list = page.get_links()
+        
+        if has_empty_links and self.toc_pages:
 
-            for link in link_list:
-                link_text = page.get_text("text", clip=link['from'])
+            try:
+                print("DEBUG: Attempting to parse TOC from text block...")
+                toc_text_block = ""
+                for page_num in self.toc_pages:
+                    page = doc.load_page(page_num)
+                    toc_text_block += self._clean_text_of_footers(page.get_text())
                 
-                is_a_real_toc_entry = False
-                for keyword in self.chapter_keywords:
-                    if keyword.lower() in link_text.lower():
-                        is_a_real_toc_entry = True
-                        break
+                all_titles = re.split(r'(?<=[a-z?!])(?=[A-Z])', toc_text_block)
+                all_titles = [title.strip() for title in all_titles if "Table of Contents" not in title and title.strip()]
                 
-                if is_a_real_toc_entry:
-                    temp_link_dict = {}
-                    temp_link_dict['text'] = link_text.strip()
-                    temp_link_dict['dest_page'] = link['page']
-                    toc_destinations.append(temp_link_dict)
+                toc_links_on_pages = [link['link_obj'] for link in raw_links if link['source_page'] in self.toc_pages]
+                
+                unique_links = []
+                seen_pages_for_links = set()
+                for link_obj in toc_links_on_pages:
+                    dest_page = link_obj['page']
+                    if dest_page not in seen_pages_for_links:
+                        unique_links.append(link_obj)
+                        seen_pages_for_links.add(dest_page)
+                
+                all_toc_pairs = zip(all_titles, unique_links)
+
+                toc_destinations = []
+                seen_pages = set()
+                for title, link_obj in all_toc_pairs:
+                    dest_page = link_obj['page']
+                    if dest_page in seen_pages:
+                        continue
+                    
+                    for keyword in self.chapter_keywords:
+                        if keyword in title.lower():
+                            toc_destinations.append({
+                                'text': title,
+                                'dest_page': dest_page
+                            })
+                            seen_pages.add(dest_page)
+                            break
+
+            except Exception as e:
+                print(f"ERROR: Special TOC parsing failed: {e}")
+        
+        if not toc_destinations:
+            for link_data in raw_links:
+                if link_data['source_page'] in self.toc_pages:
+                    for keyword in self.chapter_keywords:
+                        if keyword.lower() in link_data['text'].lower():
+                            toc_destinations.append({
+                                'text': link_data['text'].replace('\n', ' ').strip(),
+                                'dest_page': link_data['link_obj']['page']
+                            })
+                            break
 
         return toc_destinations, first_page
         
@@ -482,17 +544,22 @@ class MainWindow(QMainWindow):
         print(f"================== The true TOC pages are: {self.toc_pages} =======================")
         print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
         return true_last_toc_page + 1
-    
-    def _is_block_a_footer(self, block_text, y_pos, page_height):
-        for pattern in self.footer_patterns:
-            if pattern.search(block_text):
-                return True
+
+    def _should_skip_block(self, block_text, y_pos, page_height):
+        if y_pos > (page_height * 0.9) and len(block_text) < 100:
+            for keyword in self.chapter_keywords:
+                if keyword in block_text.lower():
+                    return False
             
-        if y_pos > (page_height * 0.90):
             if re.search(r'\d', block_text):
                 return True
+            return False
         
-        return False
+    def _clean_text_of_footers(self, block_text):
+        cleaned_text = block_text
+        for pattern in self.footer_patterns:
+            cleaned_text = pattern.sub('', cleaned_text)
+        return cleaned_text.strip()
 
     def _extract_text_from_pdf(self, doc, start_page, toc_destinations):
         full_text = []
@@ -516,12 +583,14 @@ class MainWindow(QMainWindow):
                         block_text = block[4].strip()
                         y_pos = block[1]
                         
-                        if self._is_block_a_footer(block_text, y_pos, page_height):
-                            print(f"Found and skipped footer on page {p.number + 1}: '{block_text}")
+                        if self._should_skip_block(block_text, y_pos, p.rect.height):
+                            print(f"Skipped isolated footer on page {p.number + 1}: '{block_text.strip()}")
                             continue
 
-                        if block_text:
-                            text_list.append(block_text)
+                        cleaned_text = self._clean_text_of_footers(block_text)
+
+                        if cleaned_text:
+                            text_list.append(cleaned_text)
                         
                 return text_list
 
@@ -545,8 +614,8 @@ class MainWindow(QMainWindow):
                 if page_content_text:
                     top_block_text = page_content_text[0]
 
-                cleaned_top_block = top_block_text.replace('\n', ' ').strip().lower()
-                cleaned_toc_title = chapter_title_for_this_page.strip().lower()
+                cleaned_top_block = top_block_text.replace('\n', ' ').replace(' ', '').lower()
+                cleaned_toc_title = chapter_title_for_this_page.replace('\n', ' ').replace(' ', '').lower()
 
                 # --- START OF DEBUG BLOCK ---
                 print(f"\n----- TITLE CHECK ON PAGE {page_num} -----")
