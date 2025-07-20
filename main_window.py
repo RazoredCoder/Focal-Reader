@@ -7,6 +7,10 @@ from appdirs import AppDirs
 import fitz  # Import for PyMuPDF
 import re # Import regular expressions for finding numbers
 
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
+
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
@@ -96,7 +100,8 @@ class MainWindow(QMainWindow):
             # Pattern 2: For footers like "11 | P a g e"
             re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE),
         ]
-        
+        self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
+
         self.toc_pages = []
         self.sentences = []
         self.sentence_spans = [] 
@@ -385,7 +390,7 @@ class MainWindow(QMainWindow):
             self, 
             "Open File", 
             "", 
-            "All Readable Files (*.txt *.pdf);;Text Files (*.txt);;PDF Files (*.pdf)"
+            "All Readable Files (*.txt *.pdf *.epub);;Text Files (*.txt);;PDF Files (*.pdf);;EPUB Files (*.epub)"
         )
         if not file_path:
             return
@@ -403,6 +408,12 @@ class MainWindow(QMainWindow):
                     print(f"======>>>>> This is the TOC destinations dictionary: {self.toc_destinations}")
                 self.fix_start_button.setEnabled(True)
                 self.emergency_button.setEnabled(True)
+            
+            elif file_path.lower().endswith('.epub'):
+                content = self._extract_text_from_epub(file_path)
+                self.fix_start_button.setEnabled(False)
+                self.emergency_button.setEnabled(False)
+
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -411,9 +422,63 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error Reading File", f"Could not read the file.\n\nError: {e}")
 
-    def _parse_toc_links(self, doc):
-        self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
+    def _extract_text_from_epub(self, file_path):
+        print(f"Opening EPUB: {file_path}")
+        book = epub.read_epub(file_path)
+        # This will now hold the text of each full chapter.
+        chapter_parts = []
+        
+        skip_keywords = ['table of contents', 'contents', 'copyright', 'isbn']
 
+        print("Attempting extraction with get_items()...")
+        items_to_process = list(book.get_items())
+
+        # Check if the first method would yield any documents. If not, prepare to use the spine.
+        has_docs_in_items = any(item.get_type() == ebooklib.ITEM_DOCUMENT for item in items_to_process)
+
+        if not has_docs_in_items:
+            print("No documents found via get_items(), preparing to use spine...")
+            items_to_process = [book.get_item_with_href(item_id) for item_id, _ in book.spine]
+
+
+        for item in items_to_process:
+            # We need to handle items from get_items() and get_item_with_href()
+            if not item or item.get_type() != ebooklib.ITEM_DOCUMENT:
+                continue
+                
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            
+            # --- NEW PARAGRAPH LOGIC ---
+            # Find all the <p> tags, which usually represent paragraphs.
+            paragraphs = [p.get_text(strip=True) for p in soup.find_all('p')]
+            
+            # Join the paragraphs with double newlines.
+            chapter_text = "\n\n".join(p for p in paragraphs if p)
+            # --- END NEW LOGIC ---
+
+            if not chapter_text:
+                continue
+
+            # Keyword Skipping Logic
+            should_skip = False
+            preview_text = chapter_text[:500].lower()
+            for keyword in skip_keywords:
+                if keyword in preview_text:
+                    print(f"Skipping page containing keyword: '{keyword}'")
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                continue
+            
+            chapter_parts.append(chapter_text)
+        
+        # Join all the processed CHAPTERS together.
+        content = "\n\n".join(chapter_parts)
+
+        return content
+    
+    def _parse_toc_links(self, doc):
         raw_links = []
         has_empty_links = False
         for page_num in range(min(15, len(doc))):
