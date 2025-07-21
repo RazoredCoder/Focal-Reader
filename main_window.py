@@ -130,6 +130,9 @@ class MainWindow(QMainWindow):
         self.hover_format = QTextCharFormat()
         self.hover_format.setBackground(QColor("#F5F5F5"))
 
+        self.clear_format = QTextCharFormat()
+        self.clear_format.setBackground(QColor("transparent"))
+
     def _setup_config_and_nlp(self):
         APP_NAME = "FocalReader"
         APP_AUTHOR = "Maksymilian Wicinski"
@@ -207,12 +210,12 @@ class MainWindow(QMainWindow):
         cursor = self.text_area.textCursor()
         cursor.setPosition(start)
         cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, end - start)
-        cursor.setCharFormat(text_format)
+        cursor.mergeCharFormat(text_format)
         return cursor
 
     def _clear_highlight(self, highlighter):
         if highlighter:
-            highlighter.setCharFormat(QTextCharFormat())
+            highlighter.mergeCharFormat(self.clear_format)
 
     def on_text_area_hovered(self, position):
         if self.playback_state == "PLAYING": return
@@ -418,11 +421,10 @@ class MainWindow(QMainWindow):
                 # 2. Get the clean, grouped list of chapter files
                 chapter_groups, non_text_files = self._get_epub_chapter_groups(book)
                 
-                # 3. Call the first dummy method to get the raw HTML
-                raw_html = self._extract_raw_html_from_epub(book, chapter_groups)
-                
-                # 4. Call the second dummy method to display the HTML and reset the state
-                self._process_epub_content(raw_html)
+                final_html, final_plain_text = self._process_epub_chapters(book, chapter_groups)
+
+                self.text_area.setHtml(final_html)
+                self._process_text(final_plain_text, update_display=False)
                 
                 # Disable PDF-specific buttons
                 self.fix_start_button.setEnabled(False)
@@ -563,6 +565,60 @@ class MainWindow(QMainWindow):
             print(f"  -> Group {i+1}: {group}")
 
         return final_chapter_groups, non_text_files
+    
+    def _process_epub_chapters(self, book, chapter_groups):
+        """
+        Process the grouped chapter files to produce two distinct outputs:
+        1. A single, sanitized HTML string with custom CSS for display.
+        2. A single, clean plain-text string with proper paragraph breaks for TTS/naivation,
+        """
+        print("\n--- Phase 2: Running Dual Output Processor ---")
+        html_body_parts = []
+        plain_text_parts = []
+        default_css = """
+        <style>
+            body {
+                font-family: serif;
+                font-size: 16px;
+                line-height: 1.6;
+                margin: 20px;
+            }
+            h1, h2, h3 {
+                font-family: sans-serif;
+                margin-top: 30px;
+                margin-bottom: 10px;
+                line-height: 1.2;
+            }
+        </style>
+        """
+        
+        for i, group in enumerate(chapter_groups):
+            print(f"  -> Processing Group {i+1}/{len(chapter_groups)}")
+            for file_href in group:
+                item = book.get_item_with_href(file_href)
+                if not item:
+                    continue
+
+                soup = BeautifulSoup(item.get_content(), 'html.parser')
+
+                for tag in soup.find_all('link'):
+                    tag.decompose()
+                for tag in soup.find_all(style=True):
+                    del tag['style']
+
+                if soup.body:
+                    html_body_parts.append(str(soup.body))
+                
+                for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
+                    text = tag.get_text(strip=True)
+                    if text:
+                        plain_text_parts.append(text)
+        
+        final_html = default_css + "".join(html_body_parts)
+        final_plain_text = "\n\n".join(plain_text_parts)
+
+        print("-> Finished processing. Returning final HTML and plain text.")
+        return final_html, final_plain_text
     
     def _extract_raw_html_from_epub(self, book, chapter_groups):
         """
@@ -838,86 +894,69 @@ class MainWindow(QMainWindow):
 
         return final_text            
 
-    def _process_text(self, raw_text):
+    def _process_text(self, raw_text, update_display=True):
         print("Processing text...")
         
+        # Reset all data structures
         self.sentences = []
         self.sentence_spans = []
         self.paragraph_sentence_map = []
         
+        # Handle empty input
         if not raw_text:
             self.text_area.setText("")
             self.stop_tts()
             return
 
-        combined_pattern_str = r'([^\.\?!])\s*\n(?=(?:' + '|'.join(self.chapter_keywords) + r'))'
-        raw_text = re.sub(combined_pattern_str, r'\1.\n', raw_text, flags=re.IGNORECASE)
-
-        # Part 1: Text Cleaning
-        para_break_placeholder = " [PARA_BREAK] "
-        
-        processed_text = raw_text.replace('\n\n', para_break_placeholder)
-        
-        for keyword in self.chapter_keywords:
-            processed_text = re.sub(r'\n\s*(' + keyword + r'(\s+\d+)?)', rf'{para_break_placeholder}\1', processed_text, flags=re.IGNORECASE)
-
-        raw_sentence_spans = list(self.tokenizer.span_tokenize(processed_text))
-
-        cleaned_paragraphs = []
-        current_paragraph_sentences = []
-
-        for i, (start, end) in enumerate(raw_sentence_spans):
-            sentence_text = processed_text[start:end]
-            unwrapped_sentence = sentence_text.replace('\n', ' ').strip()
-            if unwrapped_sentence:
-                current_paragraph_sentences.append(unwrapped_sentence)
-
-            is_last_sentence = (i == len(raw_sentence_spans) - 1)
-            next_char_is_newline = (end < len(processed_text) and processed_text[end] == '\n')
+        # Perform any initial cleaning on the raw text before display or analysis
+        final_text = raw_text.replace('\u2028', '\n') # Normalize paragraph separators
             
-            if (is_last_sentence or next_char_is_newline) and current_paragraph_sentences:
-                cleaned_paragraph = " ".join(current_paragraph_sentences)
-                cleaned_paragraphs.append(cleaned_paragraph)
-                current_paragraph_sentences = []
+        if update_display:    
+            self.text_area.setText(final_text)
 
-        final_text = "\n\n".join(cleaned_paragraphs)
-        final_text = final_text.replace(para_break_placeholder.strip(), "\n\n")
-        self.text_area.setText(final_text)
-
-        # --- Part 2: Analyze the final, clean text to build the navigation maps ---
-
+        # --- THE FIX: PART 1 ---
+        # We MUST use the text area's own plain text version to build our maps.
+        # This guarantees that all character positions for highlighting and clicking are perfectly synchronized.
         full_text_for_analysis = self.text_area.toPlainText()
 
-        # 2a. Get the master list of sentences and their character positions (spans).
+        # Build the master sentence list and spans from the widget's text
         self.sentence_spans = list(self.tokenizer.span_tokenize(full_text_for_analysis))
         self.sentences = [full_text_for_analysis[start:end] for start, end in self.sentence_spans]
 
-        # 2b. Build the paragraph map by checking the text *between* sentences.
-        self.paragraph_sentence_map = []
         if not self.sentences:
             print("Processing complete: No sentences found.")
             self.stop_tts()
             return
 
-        current_paragraph_indices = []
-        for i, (start, end) in enumerate(self.sentence_spans):
-            current_paragraph_indices.append(i)
+        # --- THE FIX: PART 2 ---
+        # A new, more robust way to build the paragraph map. Instead of searching for "\n\n",
+        # we iterate through the document's actual paragraph blocks.
+        doc = self.text_area.document()
+        block = doc.begin()
+        sentence_cursor = 0
+        
+        while block.isValid():
+            block_text = block.text()
+            if not block_text.strip(): # Skip empty blocks
+                block = block.next()
+                continue
 
-            is_last_sentence = (i == len(self.sentence_spans) - 1)
-
-            # Define the region of text to check for a paragraph break.
-            check_start = end
-            check_end = len(full_text_for_analysis)
-            if not is_last_sentence:
-                # Look only between the end of this sentence and the start of the next one.
-                check_end = self.sentence_spans[i + 1][0]
+            # Find how many sentences from our master list fall within this block
+            first_sentence_in_block = sentence_cursor
+            block_end_pos = block.position() + block.length()
             
-            intervening_text = full_text_for_analysis[check_start:check_end]
+            while (sentence_cursor < len(self.sentence_spans) and 
+                   self.sentence_spans[sentence_cursor][1] <= block_end_pos):
+                sentence_cursor += 1
+            
+            last_sentence_in_block = sentence_cursor
+            
+            # Create a list of indices for the sentences in this paragraph/block
+            para_indices = list(range(first_sentence_in_block, last_sentence_in_block))
+            if para_indices:
+                self.paragraph_sentence_map.append(para_indices)
 
-            # If we find a double newline or it's the last sentence, this paragraph is complete.
-            if "\n\n" in intervening_text or is_last_sentence:
-                self.paragraph_sentence_map.append(current_paragraph_indices)
-                current_paragraph_indices = []
+            block = block.next()
 
         # --- Finalization ---
         print(f"Processed {len(self.sentences)} sentences in {len(self.paragraph_sentence_map)} paragraphs.")
