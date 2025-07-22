@@ -19,6 +19,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from settings_dialog import SettingsDialog
 from emergency_dialog import EmergencyDialog
+from pdf_handler import PDFHandler
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
@@ -90,19 +91,21 @@ class MainWindow(QMainWindow):
         self.worker = None
         
         self.playback_state = "STOPPED"
-        
         self.current_file_path = None
         self.current_start_page = None
+        self.toc_destinations = [] # Still needed for "Fix Start"
 
+        # These patterns will be passed to the handler
         self.footer_patterns = [
-            # Pattern 1: For footers like "Page 1 Goldenagato | mp4directs.com"
             re.compile(r'^Page\s+\d+', re.IGNORECASE),
-            # Pattern 2: For footers like "11 | P a g e"
             re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE),
         ]
         self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
+        
+        # --- NEW: Instantiate the handler ---
+        self.pdf_handler = PDFHandler(self.chapter_keywords, self.footer_patterns)
 
-        self.toc_pages = []
+        # (The rest of __init__ is mostly unchanged)
         self.sentences = []
         self.sentence_spans = [] 
         self.paragraph_sentence_map = []
@@ -377,22 +380,21 @@ class MainWindow(QMainWindow):
         self.stop_tts()
 
     def load_previous_page(self):
-        if self.current_file_path == None: return
-        if self.current_start_page <= 0: return
-
+        if self.current_file_path is None or self.current_start_page <= 0:
+            return
+        
         new_start_page = self.current_start_page - 1
-        doc = fitz.open(self.current_file_path)
-        text = self._extract_text_from_pdf(doc, new_start_page, self.toc_destinations)
-        self._process_text(text)
+        print(f"Attempting to reload from page {new_start_page}...")
+        # We can just call the handler again with a start page override
+        content, _, _ = self.pdf_handler.process_pdf(self.current_file_path, start_page_override=new_start_page)
+        self._process_pdf_text(content)
         self.current_start_page = new_start_page
     
     def open_file(self):
         if self.playback_state != "STOPPED": self.stop_tts()
         
         file_path, _ = QFileDialog.getOpenFileName(
-            self, 
-            "Open File", 
-            "", 
+            self, "Open File", "", 
             "All Readable Files (*.txt *.pdf *.epub);;Text Files (*.txt);;PDF Files (*.pdf);;EPUB Files (*.epub)"
         )
         if not file_path:
@@ -401,36 +403,29 @@ class MainWindow(QMainWindow):
         self.current_file_path = file_path
         
         try:
-            # Logic for PDF files
+            # --- REFACTORED PDF LOGIC ---
             if file_path.lower().endswith('.pdf'):
-                with fitz.open(file_path) as doc:
-                    self.toc_destinations, self.current_start_page = self._parse_toc_links(doc)
-                    content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
+                # Delegate all processing to the handler
+                content, self.toc_destinations, self.current_start_page = self.pdf_handler.process_pdf(file_path)
+                
                 self.fix_start_button.setEnabled(True)
                 self.emergency_button.setEnabled(True)
-                # Call the dedicated PDF/TXT processor
                 self._process_pdf_text(content)
             
-            # Logic for EPUB files
+            # (EPUB and TXT logic remains the same)
             elif file_path.lower().endswith('.epub'):
                 book = epub.read_epub(file_path)
                 chapter_groups, non_text_files = self._get_epub_chapter_groups(book)
                 final_html, final_plain_text = self._process_epub_chapters(book, chapter_groups)
-
-                # Display the styled HTML
                 self.text_area.setHtml(final_html)
-                # Call the dedicated EPUB processor, telling it not to update the display
                 self._process_epub_text(final_plain_text, update_display=False)
-                
                 self.fix_start_button.setEnabled(False)
                 self.emergency_button.setEnabled(False)
 
-            # Logic for plain text files
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 self.current_start_page = 0
-                # Call the dedicated PDF/TXT processor
                 self._process_pdf_text(content)
 
         except Exception as e:
@@ -654,240 +649,7 @@ class MainWindow(QMainWindow):
         # Use setHtml to render the raw HTML in the text widget.
         self.text_area.setHtml(raw_html)
         print("-> Displayed raw HTML in the text area.")
-    
-    def _parse_toc_links(self, doc):
-        raw_links = []
-        has_empty_links = False
-        for page_num in range(min(15, len(doc))):
-            page = doc.load_page(page_num)
-            link_list = page.get_links()
 
-            print(f"--- Page {page_num + 1} ---")
-            for link in link_list:
-                link_text = page.get_text("text", clip=link['from']).strip()
-                if not link_text:
-                    has_empty_links = True
-                raw_links.append({'link_obj': link, 'text': link_text, 'source_page': page_num})
-                
-                print(f"Found a link: {link}")
-                print(f"Its link text is {link_text}")
-
-        toc_page_candidates = []
-
-        if has_empty_links:
-            print("DEBUG: Empty links detected. Using full-page text analysis to find TOC.")
-
-            toc_keyword_pattern = re.compile('|'.join(self.chapter_keywords), re.IGNORECASE)
-            for page_num in range(min(15, len(doc))):
-                if any(link['source_page'] == page_num for link in raw_links):
-                    page_text = doc.load_page(page_num).get_text().lower()
-                    matches = toc_keyword_pattern.findall(page_text)
-                    occurrence_count = len(matches)
-
-                    print(f"DEBUG: Page {page_num} has {occurrence_count} keyword occurrences.")
-
-                    if occurrence_count > 4:
-                        toc_page_candidates.append(page_num)
-        
-        else:
-            print("DEBUG: Standard links detected. Using link text analysis to find TOC.")
-            for link_data in raw_links:
-                for keyword in self.chapter_keywords:
-                    if keyword in link_data['text'].lower():
-                        if link_data['source_page'] not in toc_page_candidates:
-                            toc_page_candidates.append(link_data['source_page'])
-                        break
-        
-        print(f"================== Table of content page candidates: {toc_page_candidates} =======================")
-
-        first_page = self._detect_pdf_start_page(toc_page_candidates)
-        if not first_page:
-            return [], 0
-        
-        toc_destinations = []
-        
-        if has_empty_links and self.toc_pages:
-
-            try:
-                print("DEBUG: Attempting to parse TOC from text block...")
-                toc_text_block = ""
-                for page_num in self.toc_pages:
-                    page = doc.load_page(page_num)
-                    toc_text_block += self._clean_text_of_footers(page.get_text())
-                
-                all_titles = re.split(r'(?<=[a-z?!])(?=[A-Z])', toc_text_block)
-                all_titles = [title.strip() for title in all_titles if "Table of Contents" not in title and title.strip()]
-                
-                toc_links_on_pages = [link['link_obj'] for link in raw_links if link['source_page'] in self.toc_pages]
-                
-                unique_links = []
-                seen_pages_for_links = set()
-                for link_obj in toc_links_on_pages:
-                    dest_page = link_obj['page']
-                    if dest_page not in seen_pages_for_links:
-                        unique_links.append(link_obj)
-                        seen_pages_for_links.add(dest_page)
-                
-                all_toc_pairs = zip(all_titles, unique_links)
-
-                toc_destinations = []
-                seen_pages = set()
-                for title, link_obj in all_toc_pairs:
-                    dest_page = link_obj['page']
-                    if dest_page in seen_pages:
-                        continue
-                    
-                    for keyword in self.chapter_keywords:
-                        if keyword in title.lower():
-                            toc_destinations.append({
-                                'text': title,
-                                'dest_page': dest_page
-                            })
-                            seen_pages.add(dest_page)
-                            break
-
-            except Exception as e:
-                print(f"ERROR: Special TOC parsing failed: {e}")
-        
-        if not toc_destinations:
-            for link_data in raw_links:
-                if link_data['source_page'] in self.toc_pages:
-                    for keyword in self.chapter_keywords:
-                        if keyword.lower() in link_data['text'].lower():
-                            toc_destinations.append({
-                                'text': link_data['text'].replace('\n', ' ').strip(),
-                                'dest_page': link_data['link_obj']['page']
-                            })
-                            break
-
-        return toc_destinations, first_page
-        
-    
-    def _detect_pdf_start_page(self, candidates):
-        toc_page_candidates = candidates
-        
-        true_last_toc_page = -1
-        true_toc_pages = []
-        
-        unique_candidates = sorted(list(set(toc_page_candidates)))
-        if unique_candidates:
-            first_toc_page = unique_candidates[0]
-            true_toc_pages.append(first_toc_page)
-            true_last_toc_page = first_toc_page
-
-            for i in range (1, len(unique_candidates)):
-                if unique_candidates[i] == unique_candidates[i-1] + 1:
-                    true_toc_pages.append(unique_candidates[i])
-                    true_last_toc_page = unique_candidates[i]
-                
-                else:
-                    break
-        self.toc_pages = true_toc_pages
-        print(f"================== The true TOC pages are: {self.toc_pages} =======================")
-        print(f"================== The real last TOC page is: {true_last_toc_page} =======================")
-        return true_last_toc_page + 1
-
-    def _should_skip_block(self, block_text, y_pos, page_height):
-        if y_pos > (page_height * 0.9) and len(block_text) < 100:
-            for keyword in self.chapter_keywords:
-                if keyword in block_text.lower():
-                    return False
-            
-            if re.search(r'\d', block_text):
-                return True
-            return False
-        
-    def _clean_text_of_footers(self, block_text):
-        cleaned_text = block_text
-        for pattern in self.footer_patterns:
-            cleaned_text = pattern.sub('', cleaned_text)
-        return cleaned_text.strip()
-
-    def _extract_text_from_pdf(self, doc, start_page, toc_destinations):
-        full_text_parts = []
-        skip_next_page = False
-        para_break_placeholder = " [PARA_BREAK] "
-        toc_titles = {entry['text'].strip() for entry in toc_destinations}
-
-
-        for page_num in range(start_page, len(doc)):
-            if skip_next_page:
-                skip_next_page = False
-                continue
-            
-            page = doc.load_page(page_num)
-            page_height = page.rect.height
-            # Helper function to get a clean list of text strings from a page's blocks.
-            def get_content_text_list(p):
-                text_list = []
-                raw_blocks = p.get_text("blocks")
-                for block in raw_blocks:
-                    if block[6] in [0, 1]: 
-                        block_text = block[4].strip()
-                        y_pos = block[1]
-                        
-                        if self._should_skip_block(block_text, y_pos, p.rect.height):
-                            print(f"Skipped isolated footer on page {p.number + 1}: '{block_text.strip()}")
-                            continue
-
-                        cleaned_text = self._clean_text_of_footers(block_text)
-
-                        if cleaned_text:
-                            text_list.append(cleaned_text)
-                        
-                return text_list
-
-            page_content_text = get_content_text_list(page)
-
-            chapter_title_for_this_page = None
-            for toc_entry in toc_destinations:
-                if toc_entry['dest_page'] == page_num:
-                    chapter_title_for_this_page = toc_entry['text']
-                    break
-            
-            if chapter_title_for_this_page and not page_content_text:
-                if (page_num + 1) < len(doc):
-                    next_page = doc.load_page(page_num + 1)
-                    page_content_text = get_content_text_list(next_page)
-                    skip_next_page = True
-
-
-            if chapter_title_for_this_page:
-                top_block_text = ""
-                if page_content_text:
-                    top_block_text = page_content_text[0]
-
-                cleaned_top_block = top_block_text.replace('\n', ' ').replace(' ', '').lower()
-                cleaned_toc_title = chapter_title_for_this_page.replace('\n', ' ').replace(' ', '').lower()
-
-                # --- START OF DEBUG BLOCK ---
-                print(f"\n----- TITLE CHECK ON PAGE {page_num} -----")
-                print(f"Cleaned TOC Title: '{cleaned_toc_title}'")
-                print(f"Cleaned Top Block: '{cleaned_top_block}'")
-                
-                is_missing_currently = cleaned_toc_title not in cleaned_top_block
-                print(f"  -> Is title missing (our current, flawed logic)? {is_missing_currently}")
-
-                is_missing_correctly = cleaned_top_block not in cleaned_toc_title
-                print(f"  -> Is title missing (the correct logic)? {is_missing_correctly}")
-                print("---------------------------------\n")
-                # --- END OF DEBUG BLOCK ---
-
-                if cleaned_top_block not in cleaned_toc_title:
-                    page_content_text.insert(0, chapter_title_for_this_page.strip())
-            
-            full_text_parts.extend(page_content_text)
-
-        final_text = ""
-        for i, part in enumerate(full_text_parts):
-            final_text += part
-            if part.strip() in toc_titles:
-                final_text += "\n\n"
-            else:
-                if i < len(full_text_parts) - 1:
-                    final_text += "\n"
-
-        return final_text            
 
     def _process_pdf_text(self, raw_text):
         """
@@ -1037,8 +799,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def add_and_reprocess_footer(self, footer_text):
+        # Add the new pattern and re-process the file
         new_pattern = re.compile(re.escape(footer_text), re.IGNORECASE)
-
         self.footer_patterns.append(new_pattern)
         self.reprocess_current_file()
 
@@ -1046,13 +808,10 @@ class MainWindow(QMainWindow):
         if not self.current_file_path:
             return
         
-        print("Re-processing current file with the new settings...")
-        try:
-            with fitz.open(self.current_file_path) as doc:
-                content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
-                self._process_text(content)
-        except Exception as e:
-            QMessageBox.critical(self, "Error Re-processing File", f"Could not re-read the file. \n\nError: {e}")
+        print("Re-processing current file with new settings...")
+        # The handler will now automatically use the updated footer_patterns list
+        content, self.toc_destinations, self.current_start_page = self.pdf_handler.process_pdf(self.current_file_path)
+        self._process_pdf_text(content)
     
     def open_settings(self):
         dialog = SettingsDialog(self)
