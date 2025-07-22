@@ -5,10 +5,10 @@ import nltk
 import re
 from appdirs import AppDirs
 
-from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
+from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat, QBrush
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
-                               QHBoxLayout, QPushButton, QFileDialog, QMessageBox)
+                               QHBoxLayout, QPushButton, QFileDialog, QMessageBox, QSplitter)
 
 # Local imports
 from settings_dialog import SettingsDialog
@@ -73,6 +73,82 @@ class MainWindow(QMainWindow):
         self.tts_handler.playback_stopped.connect(self._on_playback_stopped)
         self.tts_handler.error_occurred.connect(self.on_tts_error)
 
+    def _setup_ui(self):
+        self.setWindowTitle("Focal Reader")
+        self.resize(800, 600)
+        
+        # --- Menus ---
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+        setting_action = file_menu.addAction("Settings")
+        
+        # --- Main Layout Structure ---
+        self.container = QWidget()
+        self.main_layout = QVBoxLayout(self.container)
+
+        # --- Two-Column Splitter ---
+        self.splitter = QSplitter(Qt.Horizontal)
+        
+        self.text_area = InteractiveTextEdit()
+        self.text_area.setReadOnly(True)
+        
+        self.right_panel = QWidget()
+        self.right_panel_layout = QVBoxLayout(self.right_panel)
+        self.right_panel.setStyleSheet("background-color: #fafafa;") 
+        
+        self.splitter.addWidget(self.text_area)
+        self.splitter.addWidget(self.right_panel)
+        
+        self.splitter.setSizes([600, 200])
+        self.splitter.setStretchFactor(0, 1)
+
+        self.main_layout.addWidget(self.splitter, 1)
+        
+        # --- Control Buttons ---
+        controls_container = QWidget()
+        controls_layout = QHBoxLayout(controls_container)
+        
+        self.load_button = QPushButton("Load File")
+        self.emergency_button = QPushButton("Emergency Menu")
+        self.prev_paragraph_button = QPushButton("<< Prev Para")
+        self.prev_sentence_button = QPushButton("< Prev Sent")
+        self.play_button = QPushButton("Play")
+        self.next_sentence_button = QPushButton("Next Sent >")
+        self.next_paragraph_button = QPushButton("Next Para >>")
+        self.stop_button = QPushButton("Stop")
+        
+        controls_layout.addWidget(self.load_button)
+        controls_layout.addWidget(self.emergency_button)
+        controls_layout.addWidget(self.prev_paragraph_button)
+        controls_layout.addWidget(self.prev_sentence_button)
+        controls_layout.addWidget(self.play_button)
+        controls_layout.addWidget(self.next_sentence_button)
+        controls_layout.addWidget(self.next_paragraph_button)
+        controls_layout.addWidget(self.stop_button)
+        
+        self.main_layout.addWidget(controls_container, 0)
+
+        self.setCentralWidget(self.container)
+
+        # --- Connections ---
+        setting_action.triggered.connect(self.open_settings)
+        self.play_button.clicked.connect(self.play_tts)
+        self.stop_button.clicked.connect(self.stop_tts)
+        self.load_button.clicked.connect(self.open_file)
+        self.prev_sentence_button.clicked.connect(self.previous_sentence)
+        self.next_sentence_button.clicked.connect(self.next_sentence)
+        self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
+        self.next_paragraph_button.clicked.connect(self.next_paragraph)
+        self.emergency_button.clicked.connect(self.open_emergency_menu)
+        self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
+        self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
+        
+        # Initial button states
+        self.stop_button.setEnabled(False)
+        self.set_nav_buttons_enabled(False)
+        self.emergency_button.setEnabled(False)
+
+
     def _setup_formats(self):
         self.playback_format = QTextCharFormat()
         self.playback_format.setBackground(QColor("#FFF9C4")) 
@@ -92,62 +168,6 @@ class MainWindow(QMainWindow):
         self.tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
         custom_abbreviations = {'etc', 'mr', 'mrs', 'ms', 'dr', 'prof', 'rev', 'capt', 'sgt', 'col', 'gen', 'vs', 'no', 'e.g', 'i.e', 'et al'}
         self.tokenizer._params.abbrev_types.update(custom_abbreviations)
-
-    def _setup_ui(self):
-        # (This method is largely unchanged, just the button connections)
-        self.setWindowTitle("Focal Reader")
-        self.resize(800, 600)
-        
-        menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("&File")
-        setting_action = file_menu.addAction("Settings")
-        
-        self.container = QWidget()
-        self.setCentralWidget(self.container)
-        
-        self.layout = QVBoxLayout(self.container)
-        self.text_area = InteractiveTextEdit()
-        self.text_area.setReadOnly(True)
-        
-        self.layout.addWidget(self.text_area)
-        controls_container = QWidget()
-        controls_layout = QHBoxLayout(controls_container)
-        
-        self.layout.addWidget(controls_container)
-        self.prev_paragraph_button = QPushButton("<< Prev Para")
-        self.prev_sentence_button = QPushButton("< Prev Sent")
-        self.play_button = QPushButton("Play")
-        self.next_sentence_button = QPushButton("Next Sent >")
-        self.next_paragraph_button = QPushButton("Next Para >>")
-        self.stop_button = QPushButton("Stop")
-        self.load_button = QPushButton("Load File")
-        self.emergency_button = QPushButton("Emergency Menu")
-        
-        controls_layout.addWidget(self.load_button)
-        controls_layout.addWidget(self.emergency_button)
-        controls_layout.addWidget(self.prev_paragraph_button)
-        controls_layout.addWidget(self.prev_sentence_button)
-        controls_layout.addWidget(self.play_button)
-        controls_layout.addWidget(self.next_sentence_button)
-        controls_layout.addWidget(self.next_paragraph_button)
-        controls_layout.addWidget(self.stop_button)
-
-        # Connect UI elements to their actions
-        setting_action.triggered.connect(self.open_settings)
-        self.play_button.clicked.connect(self.play_tts)
-        self.stop_button.clicked.connect(self.stop_tts)
-        self.load_button.clicked.connect(self.open_file)
-        self.prev_sentence_button.clicked.connect(self.previous_sentence)
-        self.next_sentence_button.clicked.connect(self.next_sentence)
-        self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
-        self.next_paragraph_button.clicked.connect(self.next_paragraph)
-        self.emergency_button.clicked.connect(self.open_emergency_menu)
-        self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
-        self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
-        
-        self.stop_button.setEnabled(False)
-        self.set_nav_buttons_enabled(False)
-        self.emergency_button.setEnabled(False)
 
     def _apply_highlight(self, start, end, text_format):
         cursor = self.text_area.textCursor()
