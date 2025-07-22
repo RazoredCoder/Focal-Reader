@@ -404,29 +404,24 @@ class MainWindow(QMainWindow):
             # Logic for PDF files
             if file_path.lower().endswith('.pdf'):
                 with fitz.open(file_path) as doc:
-                    print(f"PDF has {len(doc)} pages.")
                     self.toc_destinations, self.current_start_page = self._parse_toc_links(doc)
                     content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
                 self.fix_start_button.setEnabled(True)
                 self.emergency_button.setEnabled(True)
-                # Process PDF text to enable navigation
-                self._process_text(content)
+                # Call the dedicated PDF/TXT processor
+                self._process_pdf_text(content)
             
-            # New, clean logic for EPUB files
+            # Logic for EPUB files
             elif file_path.lower().endswith('.epub'):
-                print("\n--- Starting EPUB loading process ---")
-                # 1. Open the book object once
                 book = epub.read_epub(file_path)
-                
-                # 2. Get the clean, grouped list of chapter files
                 chapter_groups, non_text_files = self._get_epub_chapter_groups(book)
-                
                 final_html, final_plain_text = self._process_epub_chapters(book, chapter_groups)
 
+                # Display the styled HTML
                 self.text_area.setHtml(final_html)
-                self._process_text(final_plain_text, update_display=False)
+                # Call the dedicated EPUB processor, telling it not to update the display
+                self._process_epub_text(final_plain_text, update_display=False)
                 
-                # Disable PDF-specific buttons
                 self.fix_start_button.setEnabled(False)
                 self.emergency_button.setEnabled(False)
 
@@ -435,8 +430,8 @@ class MainWindow(QMainWindow):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 self.current_start_page = 0
-                # Process text file to enable navigation
-                self._process_text(content)
+                # Call the dedicated PDF/TXT processor
+                self._process_pdf_text(content)
 
         except Exception as e:
             import traceback
@@ -894,54 +889,124 @@ class MainWindow(QMainWindow):
 
         return final_text            
 
-    def _process_text(self, raw_text, update_display=True):
-        print("Processing text...")
+    def _process_pdf_text(self, raw_text):
+        """
+        Processes plain text extracted from PDF or TXT files.
+        This method is responsible for text cleaning, paragraph unwrapping,
+        and building the sentence/paragraph maps for navigation.
+        """
+        print("Processing PDF/TXT text...")
         
-        # Reset all data structures
         self.sentences = []
         self.sentence_spans = []
         self.paragraph_sentence_map = []
         
-        # Handle empty input
         if not raw_text:
             self.text_area.setText("")
             self.stop_tts()
             return
 
-        # Perform any initial cleaning on the raw text before display or analysis
-        final_text = raw_text.replace('\u2028', '\n') # Normalize paragraph separators
+        combined_pattern_str = r'([^\.\?!])\s*\n(?=(?:' + '|'.join(self.chapter_keywords) + r'))'
+        raw_text = re.sub(combined_pattern_str, r'\1.\n', raw_text, flags=re.IGNORECASE)
+
+        para_break_placeholder = " [PARA_BREAK] "
+        processed_text = raw_text.replace('\n\n', para_break_placeholder)
+        
+        for keyword in self.chapter_keywords:
+            processed_text = re.sub(r'\n\s*(' + keyword + r'(\s+\d+)?)', rf'{para_break_placeholder}\1', processed_text, flags=re.IGNORECASE)
+
+        raw_sentence_spans = list(self.tokenizer.span_tokenize(processed_text))
+        cleaned_paragraphs = []
+        current_paragraph_sentences = []
+
+        for i, (start, end) in enumerate(raw_sentence_spans):
+            sentence_text = processed_text[start:end]
+            unwrapped_sentence = sentence_text.replace('\n', ' ').strip()
+            if unwrapped_sentence:
+                current_paragraph_sentences.append(unwrapped_sentence)
+
+            is_last_sentence = (i == len(raw_sentence_spans) - 1)
+            next_char_is_newline = (end < len(processed_text) and processed_text[end] == '\n')
             
+            if (is_last_sentence or next_char_is_newline) and current_paragraph_sentences:
+                cleaned_paragraph = " ".join(current_paragraph_sentences)
+                cleaned_paragraphs.append(cleaned_paragraph)
+                current_paragraph_sentences = []
+
+        final_text = "\n\n".join(cleaned_paragraphs)
+        final_text = final_text.replace(para_break_placeholder.strip(), "\n\n")
+        self.text_area.setText(final_text)
+
+        full_text_for_analysis = self.text_area.toPlainText()
+        self.sentence_spans = list(self.tokenizer.span_tokenize(full_text_for_analysis))
+        self.sentences = [full_text_for_analysis[start:end] for start, end in self.sentence_spans]
+        self.paragraph_sentence_map = []
+        if not self.sentences:
+            self.stop_tts()
+            return
+
+        current_paragraph_indices = []
+        for i, (start, end) in enumerate(self.sentence_spans):
+            current_paragraph_indices.append(i)
+            is_last_sentence = (i == len(self.sentence_spans) - 1)
+            check_start = end
+            check_end = len(full_text_for_analysis)
+            if not is_last_sentence:
+                check_end = self.sentence_spans[i + 1][0]
+            
+            intervening_text = full_text_for_analysis[check_start:check_end]
+            if "\n\n" in intervening_text or is_last_sentence:
+                self.paragraph_sentence_map.append(current_paragraph_indices)
+                current_paragraph_indices = []
+
+        print(f"Processed {len(self.sentences)} sentences in {len(self.paragraph_sentence_map)} paragraphs.")
+        self.current_sentence_index = 0
+        nav_enabled = bool(self.sentences)
+        self.prev_sentence_button.setEnabled(nav_enabled)
+        self.next_sentence_button.setEnabled(nav_enabled)
+        self.prev_paragraph_button.setEnabled(nav_enabled)
+        self.next_paragraph_button.setEnabled(nav_enabled)
+
+    def _process_epub_text(self, raw_text, update_display=True):
+        """
+        Processes the plain text extracted from EPUB files.
+        This method builds the sentence/paragraph maps from the widget's content
+        to ensure highlighting and navigation work correctly with HTML.
+        """
+        print("Processing EPUB text...")
+        
+        self.sentences = []
+        self.sentence_spans = []
+        self.paragraph_sentence_map = []
+        
+        if not raw_text:
+            self.text_area.setText("")
+            self.stop_tts()
+            return
+
+        final_text = raw_text.replace('\u2028', '\n')
+        
         if update_display:    
             self.text_area.setText(final_text)
 
-        # --- THE FIX: PART 1 ---
-        # We MUST use the text area's own plain text version to build our maps.
-        # This guarantees that all character positions for highlighting and clicking are perfectly synchronized.
         full_text_for_analysis = self.text_area.toPlainText()
-
-        # Build the master sentence list and spans from the widget's text
         self.sentence_spans = list(self.tokenizer.span_tokenize(full_text_for_analysis))
         self.sentences = [full_text_for_analysis[start:end] for start, end in self.sentence_spans]
 
         if not self.sentences:
-            print("Processing complete: No sentences found.")
             self.stop_tts()
             return
 
-        # --- THE FIX: PART 2 ---
-        # A new, more robust way to build the paragraph map. Instead of searching for "\n\n",
-        # we iterate through the document's actual paragraph blocks.
         doc = self.text_area.document()
         block = doc.begin()
         sentence_cursor = 0
         
         while block.isValid():
             block_text = block.text()
-            if not block_text.strip(): # Skip empty blocks
+            if not block_text.strip():
                 block = block.next()
                 continue
 
-            # Find how many sentences from our master list fall within this block
             first_sentence_in_block = sentence_cursor
             block_end_pos = block.position() + block.length()
             
@@ -950,15 +1015,11 @@ class MainWindow(QMainWindow):
                 sentence_cursor += 1
             
             last_sentence_in_block = sentence_cursor
-            
-            # Create a list of indices for the sentences in this paragraph/block
             para_indices = list(range(first_sentence_in_block, last_sentence_in_block))
             if para_indices:
                 self.paragraph_sentence_map.append(para_indices)
-
             block = block.next()
 
-        # --- Finalization ---
         print(f"Processed {len(self.sentences)} sentences in {len(self.paragraph_sentence_map)} paragraphs.")
         self.current_sentence_index = 0
         nav_enabled = bool(self.sentences)
