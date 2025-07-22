@@ -20,6 +20,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from settings_dialog import SettingsDialog
 from emergency_dialog import EmergencyDialog
 from pdf_handler import PDFHandler
+from epub_handler import EpubHandler
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
@@ -87,41 +88,32 @@ class Worker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.thread = None
-        self.worker = None
-        
+        self.thread, self.worker = None, None
         self.playback_state = "STOPPED"
-        self.current_file_path = None
-        self.current_start_page = None
-        self.toc_destinations = [] # Still needed for "Fix Start"
+        self.current_file_path, self.current_start_page = None, None
+        self.toc_destinations = []
 
-        # These patterns will be passed to the handler
         self.footer_patterns = [
             re.compile(r'^Page\s+\d+', re.IGNORECASE),
             re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE),
         ]
         self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
         
-        # --- NEW: Instantiate the handler ---
+        # --- Instantiate Handlers ---
         self.pdf_handler = PDFHandler(self.chapter_keywords, self.footer_patterns)
+        self.epub_handler = EpubHandler(self.chapter_keywords) # <-- NEW
 
-        # (The rest of __init__ is mostly unchanged)
-        self.sentences = []
-        self.sentence_spans = [] 
-        self.paragraph_sentence_map = []
+        self.sentences, self.sentence_spans, self.paragraph_sentence_map = [], [], []
         self.current_sentence_index = 0
-        
-        self.playback_highlighter = None
-        self.hover_highlighter = None
-        self._setup_formats()
+        self.playback_highlighter, self.hover_highlighter = None, None
         
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
         self.buffer = QBuffer()
-        
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         
+        self._setup_formats()
         self._setup_config_and_nlp()
         self._setup_ui()
         self.load_and_set_credentials()
@@ -393,38 +385,30 @@ class MainWindow(QMainWindow):
     def open_file(self):
         if self.playback_state != "STOPPED": self.stop_tts()
         
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open File", "", 
-            "All Readable Files (*.txt *.pdf *.epub);;Text Files (*.txt);;PDF Files (*.pdf);;EPUB Files (*.epub)"
-        )
-        if not file_path:
-            return
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", 
+            "All Readable Files (*.txt *.pdf *.epub);;Text Files (*.txt);;PDF Files (*.pdf);;EPUB Files (*.epub)")
+        if not file_path: return
         
         self.current_file_path = file_path
         
         try:
-            # --- REFACTORED PDF LOGIC ---
             if file_path.lower().endswith('.pdf'):
-                # Delegate all processing to the handler
                 content, self.toc_destinations, self.current_start_page = self.pdf_handler.process_pdf(file_path)
-                
                 self.fix_start_button.setEnabled(True)
                 self.emergency_button.setEnabled(True)
                 self._process_pdf_text(content)
             
-            # (EPUB and TXT logic remains the same)
+            # --- REFACTORED EPUB LOGIC ---
             elif file_path.lower().endswith('.epub'):
-                book = epub.read_epub(file_path)
-                chapter_groups, non_text_files = self._get_epub_chapter_groups(book)
-                final_html, final_plain_text = self._process_epub_chapters(book, chapter_groups)
+                # Delegate all processing to the handler
+                final_html, final_plain_text = self.epub_handler.process_epub(file_path)
                 self.text_area.setHtml(final_html)
                 self._process_epub_text(final_plain_text, update_display=False)
                 self.fix_start_button.setEnabled(False)
                 self.emergency_button.setEnabled(False)
 
-            else:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
+            else: # TXT files
+                with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
                 self.current_start_page = 0
                 self._process_pdf_text(content)
 
@@ -432,224 +416,6 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error Reading File", f"Could not read the file.\n\nError: {e}")
-
-    def _find_essential_files_in_toc(self, book):
-        """
-        Parses the book's Table of Contents to find the starting file (href)
-        for each entry that looks like a real chapter.
-        Returns a set of these essential file hrefs.
-        """
-        print("\n--- Helper: Finding Essential Chapters from Table of Contents ---")
-        essential_files = set()
-        if not book.toc:
-            print("[WARNING] Book has no identifiable Table of Contents (book.toc).")
-            return essential_files
-
-        for link in book.toc:
-            # This loop is already quite clear, but we can add a small print.
-            # print(f"  -> Examining TOC entry: '{link.title}'")
-            for keyword in self.chapter_keywords:
-                if keyword in link.title.lower():
-                    href = link.href.split('#')[0]
-                    print(f"  -> Found essential chapter in TOC: '{link.title}' -> {href}")
-                    essential_files.add(href)
-                    break
-        
-        print(f"\n[RESULT] Essential files from TOC: {list(essential_files)}")
-        return essential_files
-
-    def _get_epub_chapter_groups(self, book):
-        """
-        Orchestrates the entire "Source of Truth" algorithm to produce a clean,
-        grouped list of chapter files and a list of non-text files.
-        """
-        print("\n\n--- RUNNING 'SOURCE OF TRUTH' FILE IDENTIFICATION (VERBOSE) ---")
-
-        # --- Initial Setup ---
-        skip_keywords = [
-            'copyright', 'isbn', 'translation by', 'cover art', 'yen press',
-            'kadokawa', 'tuttle-mori', 'library of congress', 'lccn', 'e-book',
-            'ebook', 'first published', 'english translation', 'visit us at'
-        ]
-        kept_files, discarded_files, non_text_files = [], [], []
-        JUNK_CHECK_LIMIT = 5
-        print(f"[CONFIG] Will check the first {JUNK_CHECK_LIMIT} real text documents for junk keywords.")
-
-        # --- Phase 2 is now in a helper method ---
-        essential_files_from_toc = self._find_essential_files_in_toc(book)
-
-        # --- Phase 1: Splitting Spine into Kept and Discarded Files ---
-        print("\n--- PHASE 1: Splitting Spine into Kept and Discarded Files ---")
-        id_to_item_map = {item.id: item for item in book.get_items()}
-        spine_ids = [item[0] for item in book.spine]
-        documents_checked_count = 0
-        all_document_hrefs = []
-
-        for item_id in spine_ids:
-            item = id_to_item_map.get(item_id)
-            if item and item.get_type() == ebooklib.ITEM_DOCUMENT and item.get_name() not in all_document_hrefs:
-                all_document_hrefs.append(item.get_name())
-        
-        for file_href in all_document_hrefs:
-            print(f"\n-> Processing: '{file_href}'")
-            item = book.get_item_with_href(file_href)
-            text_content = BeautifulSoup(item.get_content(), 'html.parser').get_text().strip()
-
-            if not text_content:
-                print("  -> Result: Document has NO TEXT. Adding to non-text list.")
-                non_text_files.append(file_href)
-                continue
-
-            if documents_checked_count < JUNK_CHECK_LIMIT:
-                print(f"  -> Document has text. Checking for junk (Document to check: #{documents_checked_count + 1}).")
-                documents_checked_count += 1
-                
-                is_junk = any(keyword in text_content.lower() for keyword in skip_keywords)
-
-                if is_junk:
-                    print(f"  -> Result: Found junk keyword. DISCARDING.")
-                    discarded_files.append(file_href)
-                else:
-                    print(f"  -> Result: No junk keywords found. KEEPING.")
-                    kept_files.append(file_href)
-            else:
-                print("  -> Result: Past junk check limit. KEEPING.")
-                kept_files.append(file_href)
-        
-        print("\n[Initial Lists] Kept: ", kept_files)
-        print("[Initial Lists] Discarded: ", discarded_files)
-        print("[Initial Lists] Non-Text Files: ", non_text_files)
-
-        # --- Phase 3: Verification and Iterative Rollback ---
-        print("\n--- PHASE 3: Verifying Kept Files and Rolling Back if Needed ---")
-        missing_essentials = essential_files_from_toc - set(kept_files)
-        if not missing_essentials:
-            print("  -> No essential files are missing. No rollback needed.")
-
-        while missing_essentials and discarded_files:
-            print(f"  -> WARNING: Missing essential file(s) like '{list(missing_essentials)[0]}'. Rolling back.")
-            file_to_restore = discarded_files.pop()
-            kept_files.insert(0, file_to_restore)
-            print(f"  -> Restored '{file_to_restore}' to the kept list.")
-            missing_essentials = essential_files_from_toc - set(kept_files)
-        
-        kept_files.sort(key=all_document_hrefs.index)
-        print(f"\n[Final List] Final kept files after rollback: {kept_files}")
-
-        # --- Final Step: Chapter Grouping ---
-        print("\n--- FINAL STEP: Grouping Chapter Files ---")
-        final_chapter_groups = []
-        if kept_files:
-            current_group = [kept_files[0]]
-            for i in range(1, len(kept_files)):
-                file_href = kept_files[i]
-                if file_href in essential_files_from_toc:
-                    final_chapter_groups.append(current_group)
-                    current_group = [file_href]
-                else:
-                    current_group.append(file_href)
-            final_chapter_groups.append(current_group)
-
-        print(f"[Chapter Groups] Found {len(final_chapter_groups)} chapter groups.")
-        for i, group in enumerate(final_chapter_groups):
-            print(f"  -> Group {i+1}: {group}")
-
-        return final_chapter_groups, non_text_files
-    
-    def _process_epub_chapters(self, book, chapter_groups):
-        """
-        Process the grouped chapter files to produce two distinct outputs:
-        1. A single, sanitized HTML string with custom CSS for display.
-        2. A single, clean plain-text string with proper paragraph breaks for TTS/naivation,
-        """
-        print("\n--- Phase 2: Running Dual Output Processor ---")
-        html_body_parts = []
-        plain_text_parts = []
-        default_css = """
-        <style>
-            body {
-                font-family: serif;
-                font-size: 16px;
-                line-height: 1.6;
-                margin: 20px;
-            }
-            h1, h2, h3 {
-                font-family: sans-serif;
-                margin-top: 30px;
-                margin-bottom: 10px;
-                line-height: 1.2;
-            }
-        </style>
-        """
-        
-        for i, group in enumerate(chapter_groups):
-            print(f"  -> Processing Group {i+1}/{len(chapter_groups)}")
-            for file_href in group:
-                item = book.get_item_with_href(file_href)
-                if not item:
-                    continue
-
-                soup = BeautifulSoup(item.get_content(), 'html.parser')
-
-                for tag in soup.find_all('link'):
-                    tag.decompose()
-                for tag in soup.find_all(style=True):
-                    del tag['style']
-
-                if soup.body:
-                    html_body_parts.append(str(soup.body))
-                
-                for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
-                    text = tag.get_text(strip=True)
-                    if text:
-                        plain_text_parts.append(text)
-        
-        final_html = default_css + "".join(html_body_parts)
-        final_plain_text = "\n\n".join(plain_text_parts)
-
-        print("-> Finished processing. Returning final HTML and plain text.")
-        return final_html, final_plain_text
-    
-    def _extract_raw_html_from_epub(self, book, chapter_groups):
-        """
-        (Dummy Method) Extracts the raw, combined HTML content from the chapter groups.
-        For now, it simply gets the content of each file and joins them.
-        """
-        print("\n--- DUMMY: Extracting Raw HTML ---")
-        all_html_parts = []
-        for group in chapter_groups:
-            for file_href in group:
-                item = book.get_item_with_href(file_href)
-                if item:
-                    # get_content() returns bytes, so we decode it to a string.
-                    # 'ignore' will prevent crashes if there are weird characters.
-                    all_html_parts.append(item.get_content().decode('utf-8', 'ignore'))
-        
-        # We join the HTML of each file with a horizontal rule for a clear visual separation.
-        return "<hr>".join(all_html_parts)
-
-    def _process_epub_content(self, raw_html):
-        """
-        (Dummy Method) Processes the extracted ePub content. For now, it just
-        displays the raw HTML and resets navigation/TTS data to prevent crashes.
-        """
-        print("\n--- DUMMY: Processing ePub Content ---")
-        # Clear all data structures related to TTS and navigation.
-        self.sentences = []
-        self.sentence_spans = []
-        self.paragraph_sentence_map = []
-        self.current_sentence_index = 0
-        
-        # Disable navigation buttons since we have no sentence data yet.
-        self.prev_sentence_button.setEnabled(False)
-        self.next_sentence_button.setEnabled(False)
-        self.prev_paragraph_button.setEnabled(False)
-        self.next_paragraph_button.setEnabled(False)
-        
-        # Use setHtml to render the raw HTML in the text widget.
-        self.text_area.setHtml(raw_html)
-        print("-> Displayed raw HTML in the text area.")
-
 
     def _process_pdf_text(self, raw_text):
         """
