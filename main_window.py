@@ -7,6 +7,10 @@ from appdirs import AppDirs
 import fitz  # Import for PyMuPDF
 import re # Import regular expressions for finding numbers
 
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
+
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
@@ -96,7 +100,8 @@ class MainWindow(QMainWindow):
             # Pattern 2: For footers like "11 | P a g e"
             re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE),
         ]
-        
+        self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
+
         self.toc_pages = []
         self.sentences = []
         self.sentence_spans = [] 
@@ -124,6 +129,9 @@ class MainWindow(QMainWindow):
 
         self.hover_format = QTextCharFormat()
         self.hover_format.setBackground(QColor("#F5F5F5"))
+
+        self.clear_format = QTextCharFormat()
+        self.clear_format.setBackground(QColor("transparent"))
 
     def _setup_config_and_nlp(self):
         APP_NAME = "FocalReader"
@@ -202,12 +210,12 @@ class MainWindow(QMainWindow):
         cursor = self.text_area.textCursor()
         cursor.setPosition(start)
         cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, end - start)
-        cursor.setCharFormat(text_format)
+        cursor.mergeCharFormat(text_format)
         return cursor
 
     def _clear_highlight(self, highlighter):
         if highlighter:
-            highlighter.setCharFormat(QTextCharFormat())
+            highlighter.mergeCharFormat(self.clear_format)
 
     def on_text_area_hovered(self, position):
         if self.playback_state == "PLAYING": return
@@ -385,35 +393,274 @@ class MainWindow(QMainWindow):
             self, 
             "Open File", 
             "", 
-            "All Readable Files (*.txt *.pdf);;Text Files (*.txt);;PDF Files (*.pdf)"
+            "All Readable Files (*.txt *.pdf *.epub);;Text Files (*.txt);;PDF Files (*.pdf);;EPUB Files (*.epub)"
         )
         if not file_path:
             return
         
         self.current_file_path = file_path
         
-        content = ""
         try:
+            # Logic for PDF files
             if file_path.lower().endswith('.pdf'):
                 with fitz.open(file_path) as doc:
                     print(f"PDF has {len(doc)} pages.")
                     self.toc_destinations, self.current_start_page = self._parse_toc_links(doc)
-
                     content = self._extract_text_from_pdf(doc, self.current_start_page, self.toc_destinations)
-                    print(f"======>>>>> This is the TOC destinations dictionary: {self.toc_destinations}")
                 self.fix_start_button.setEnabled(True)
                 self.emergency_button.setEnabled(True)
+                # Process PDF text to enable navigation
+                self._process_text(content)
+            
+            # New, clean logic for EPUB files
+            elif file_path.lower().endswith('.epub'):
+                print("\n--- Starting EPUB loading process ---")
+                # 1. Open the book object once
+                book = epub.read_epub(file_path)
+                
+                # 2. Get the clean, grouped list of chapter files
+                chapter_groups, non_text_files = self._get_epub_chapter_groups(book)
+                
+                final_html, final_plain_text = self._process_epub_chapters(book, chapter_groups)
+
+                self.text_area.setHtml(final_html)
+                self._process_text(final_plain_text, update_display=False)
+                
+                # Disable PDF-specific buttons
+                self.fix_start_button.setEnabled(False)
+                self.emergency_button.setEnabled(False)
+
+            # Logic for plain text files
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 self.current_start_page = 0
-            self._process_text(content)
+                # Process text file to enable navigation
+                self._process_text(content)
+
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             QMessageBox.critical(self, "Error Reading File", f"Could not read the file.\n\nError: {e}")
 
-    def _parse_toc_links(self, doc):
-        self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
+    def _find_essential_files_in_toc(self, book):
+        """
+        Parses the book's Table of Contents to find the starting file (href)
+        for each entry that looks like a real chapter.
+        Returns a set of these essential file hrefs.
+        """
+        print("\n--- Helper: Finding Essential Chapters from Table of Contents ---")
+        essential_files = set()
+        if not book.toc:
+            print("[WARNING] Book has no identifiable Table of Contents (book.toc).")
+            return essential_files
 
+        for link in book.toc:
+            # This loop is already quite clear, but we can add a small print.
+            # print(f"  -> Examining TOC entry: '{link.title}'")
+            for keyword in self.chapter_keywords:
+                if keyword in link.title.lower():
+                    href = link.href.split('#')[0]
+                    print(f"  -> Found essential chapter in TOC: '{link.title}' -> {href}")
+                    essential_files.add(href)
+                    break
+        
+        print(f"\n[RESULT] Essential files from TOC: {list(essential_files)}")
+        return essential_files
+
+    def _get_epub_chapter_groups(self, book):
+        """
+        Orchestrates the entire "Source of Truth" algorithm to produce a clean,
+        grouped list of chapter files and a list of non-text files.
+        """
+        print("\n\n--- RUNNING 'SOURCE OF TRUTH' FILE IDENTIFICATION (VERBOSE) ---")
+
+        # --- Initial Setup ---
+        skip_keywords = [
+            'copyright', 'isbn', 'translation by', 'cover art', 'yen press',
+            'kadokawa', 'tuttle-mori', 'library of congress', 'lccn', 'e-book',
+            'ebook', 'first published', 'english translation', 'visit us at'
+        ]
+        kept_files, discarded_files, non_text_files = [], [], []
+        JUNK_CHECK_LIMIT = 5
+        print(f"[CONFIG] Will check the first {JUNK_CHECK_LIMIT} real text documents for junk keywords.")
+
+        # --- Phase 2 is now in a helper method ---
+        essential_files_from_toc = self._find_essential_files_in_toc(book)
+
+        # --- Phase 1: Splitting Spine into Kept and Discarded Files ---
+        print("\n--- PHASE 1: Splitting Spine into Kept and Discarded Files ---")
+        id_to_item_map = {item.id: item for item in book.get_items()}
+        spine_ids = [item[0] for item in book.spine]
+        documents_checked_count = 0
+        all_document_hrefs = []
+
+        for item_id in spine_ids:
+            item = id_to_item_map.get(item_id)
+            if item and item.get_type() == ebooklib.ITEM_DOCUMENT and item.get_name() not in all_document_hrefs:
+                all_document_hrefs.append(item.get_name())
+        
+        for file_href in all_document_hrefs:
+            print(f"\n-> Processing: '{file_href}'")
+            item = book.get_item_with_href(file_href)
+            text_content = BeautifulSoup(item.get_content(), 'html.parser').get_text().strip()
+
+            if not text_content:
+                print("  -> Result: Document has NO TEXT. Adding to non-text list.")
+                non_text_files.append(file_href)
+                continue
+
+            if documents_checked_count < JUNK_CHECK_LIMIT:
+                print(f"  -> Document has text. Checking for junk (Document to check: #{documents_checked_count + 1}).")
+                documents_checked_count += 1
+                
+                is_junk = any(keyword in text_content.lower() for keyword in skip_keywords)
+
+                if is_junk:
+                    print(f"  -> Result: Found junk keyword. DISCARDING.")
+                    discarded_files.append(file_href)
+                else:
+                    print(f"  -> Result: No junk keywords found. KEEPING.")
+                    kept_files.append(file_href)
+            else:
+                print("  -> Result: Past junk check limit. KEEPING.")
+                kept_files.append(file_href)
+        
+        print("\n[Initial Lists] Kept: ", kept_files)
+        print("[Initial Lists] Discarded: ", discarded_files)
+        print("[Initial Lists] Non-Text Files: ", non_text_files)
+
+        # --- Phase 3: Verification and Iterative Rollback ---
+        print("\n--- PHASE 3: Verifying Kept Files and Rolling Back if Needed ---")
+        missing_essentials = essential_files_from_toc - set(kept_files)
+        if not missing_essentials:
+            print("  -> No essential files are missing. No rollback needed.")
+
+        while missing_essentials and discarded_files:
+            print(f"  -> WARNING: Missing essential file(s) like '{list(missing_essentials)[0]}'. Rolling back.")
+            file_to_restore = discarded_files.pop()
+            kept_files.insert(0, file_to_restore)
+            print(f"  -> Restored '{file_to_restore}' to the kept list.")
+            missing_essentials = essential_files_from_toc - set(kept_files)
+        
+        kept_files.sort(key=all_document_hrefs.index)
+        print(f"\n[Final List] Final kept files after rollback: {kept_files}")
+
+        # --- Final Step: Chapter Grouping ---
+        print("\n--- FINAL STEP: Grouping Chapter Files ---")
+        final_chapter_groups = []
+        if kept_files:
+            current_group = [kept_files[0]]
+            for i in range(1, len(kept_files)):
+                file_href = kept_files[i]
+                if file_href in essential_files_from_toc:
+                    final_chapter_groups.append(current_group)
+                    current_group = [file_href]
+                else:
+                    current_group.append(file_href)
+            final_chapter_groups.append(current_group)
+
+        print(f"[Chapter Groups] Found {len(final_chapter_groups)} chapter groups.")
+        for i, group in enumerate(final_chapter_groups):
+            print(f"  -> Group {i+1}: {group}")
+
+        return final_chapter_groups, non_text_files
+    
+    def _process_epub_chapters(self, book, chapter_groups):
+        """
+        Process the grouped chapter files to produce two distinct outputs:
+        1. A single, sanitized HTML string with custom CSS for display.
+        2. A single, clean plain-text string with proper paragraph breaks for TTS/naivation,
+        """
+        print("\n--- Phase 2: Running Dual Output Processor ---")
+        html_body_parts = []
+        plain_text_parts = []
+        default_css = """
+        <style>
+            body {
+                font-family: serif;
+                font-size: 16px;
+                line-height: 1.6;
+                margin: 20px;
+            }
+            h1, h2, h3 {
+                font-family: sans-serif;
+                margin-top: 30px;
+                margin-bottom: 10px;
+                line-height: 1.2;
+            }
+        </style>
+        """
+        
+        for i, group in enumerate(chapter_groups):
+            print(f"  -> Processing Group {i+1}/{len(chapter_groups)}")
+            for file_href in group:
+                item = book.get_item_with_href(file_href)
+                if not item:
+                    continue
+
+                soup = BeautifulSoup(item.get_content(), 'html.parser')
+
+                for tag in soup.find_all('link'):
+                    tag.decompose()
+                for tag in soup.find_all(style=True):
+                    del tag['style']
+
+                if soup.body:
+                    html_body_parts.append(str(soup.body))
+                
+                for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
+                    text = tag.get_text(strip=True)
+                    if text:
+                        plain_text_parts.append(text)
+        
+        final_html = default_css + "".join(html_body_parts)
+        final_plain_text = "\n\n".join(plain_text_parts)
+
+        print("-> Finished processing. Returning final HTML and plain text.")
+        return final_html, final_plain_text
+    
+    def _extract_raw_html_from_epub(self, book, chapter_groups):
+        """
+        (Dummy Method) Extracts the raw, combined HTML content from the chapter groups.
+        For now, it simply gets the content of each file and joins them.
+        """
+        print("\n--- DUMMY: Extracting Raw HTML ---")
+        all_html_parts = []
+        for group in chapter_groups:
+            for file_href in group:
+                item = book.get_item_with_href(file_href)
+                if item:
+                    # get_content() returns bytes, so we decode it to a string.
+                    # 'ignore' will prevent crashes if there are weird characters.
+                    all_html_parts.append(item.get_content().decode('utf-8', 'ignore'))
+        
+        # We join the HTML of each file with a horizontal rule for a clear visual separation.
+        return "<hr>".join(all_html_parts)
+
+    def _process_epub_content(self, raw_html):
+        """
+        (Dummy Method) Processes the extracted ePub content. For now, it just
+        displays the raw HTML and resets navigation/TTS data to prevent crashes.
+        """
+        print("\n--- DUMMY: Processing ePub Content ---")
+        # Clear all data structures related to TTS and navigation.
+        self.sentences = []
+        self.sentence_spans = []
+        self.paragraph_sentence_map = []
+        self.current_sentence_index = 0
+        
+        # Disable navigation buttons since we have no sentence data yet.
+        self.prev_sentence_button.setEnabled(False)
+        self.next_sentence_button.setEnabled(False)
+        self.prev_paragraph_button.setEnabled(False)
+        self.next_paragraph_button.setEnabled(False)
+        
+        # Use setHtml to render the raw HTML in the text widget.
+        self.text_area.setHtml(raw_html)
+        print("-> Displayed raw HTML in the text area.")
+    
+    def _parse_toc_links(self, doc):
         raw_links = []
         has_empty_links = False
         for page_num in range(min(15, len(doc))):
@@ -647,86 +894,69 @@ class MainWindow(QMainWindow):
 
         return final_text            
 
-    def _process_text(self, raw_text):
+    def _process_text(self, raw_text, update_display=True):
         print("Processing text...")
         
+        # Reset all data structures
         self.sentences = []
         self.sentence_spans = []
         self.paragraph_sentence_map = []
         
+        # Handle empty input
         if not raw_text:
             self.text_area.setText("")
             self.stop_tts()
             return
 
-        combined_pattern_str = r'([^\.\?!])\s*\n(?=(?:' + '|'.join(self.chapter_keywords) + r'))'
-        raw_text = re.sub(combined_pattern_str, r'\1.\n', raw_text, flags=re.IGNORECASE)
-
-        # Part 1: Text Cleaning
-        para_break_placeholder = " [PARA_BREAK] "
-        
-        processed_text = raw_text.replace('\n\n', para_break_placeholder)
-        
-        for keyword in self.chapter_keywords:
-            processed_text = re.sub(r'\n\s*(' + keyword + r'(\s+\d+)?)', rf'{para_break_placeholder}\1', processed_text, flags=re.IGNORECASE)
-
-        raw_sentence_spans = list(self.tokenizer.span_tokenize(processed_text))
-
-        cleaned_paragraphs = []
-        current_paragraph_sentences = []
-
-        for i, (start, end) in enumerate(raw_sentence_spans):
-            sentence_text = processed_text[start:end]
-            unwrapped_sentence = sentence_text.replace('\n', ' ').strip()
-            if unwrapped_sentence:
-                current_paragraph_sentences.append(unwrapped_sentence)
-
-            is_last_sentence = (i == len(raw_sentence_spans) - 1)
-            next_char_is_newline = (end < len(processed_text) and processed_text[end] == '\n')
+        # Perform any initial cleaning on the raw text before display or analysis
+        final_text = raw_text.replace('\u2028', '\n') # Normalize paragraph separators
             
-            if (is_last_sentence or next_char_is_newline) and current_paragraph_sentences:
-                cleaned_paragraph = " ".join(current_paragraph_sentences)
-                cleaned_paragraphs.append(cleaned_paragraph)
-                current_paragraph_sentences = []
+        if update_display:    
+            self.text_area.setText(final_text)
 
-        final_text = "\n\n".join(cleaned_paragraphs)
-        final_text = final_text.replace(para_break_placeholder.strip(), "\n\n")
-        self.text_area.setText(final_text)
-
-        # --- Part 2: Analyze the final, clean text to build the navigation maps ---
-
+        # --- THE FIX: PART 1 ---
+        # We MUST use the text area's own plain text version to build our maps.
+        # This guarantees that all character positions for highlighting and clicking are perfectly synchronized.
         full_text_for_analysis = self.text_area.toPlainText()
 
-        # 2a. Get the master list of sentences and their character positions (spans).
+        # Build the master sentence list and spans from the widget's text
         self.sentence_spans = list(self.tokenizer.span_tokenize(full_text_for_analysis))
         self.sentences = [full_text_for_analysis[start:end] for start, end in self.sentence_spans]
 
-        # 2b. Build the paragraph map by checking the text *between* sentences.
-        self.paragraph_sentence_map = []
         if not self.sentences:
             print("Processing complete: No sentences found.")
             self.stop_tts()
             return
 
-        current_paragraph_indices = []
-        for i, (start, end) in enumerate(self.sentence_spans):
-            current_paragraph_indices.append(i)
+        # --- THE FIX: PART 2 ---
+        # A new, more robust way to build the paragraph map. Instead of searching for "\n\n",
+        # we iterate through the document's actual paragraph blocks.
+        doc = self.text_area.document()
+        block = doc.begin()
+        sentence_cursor = 0
+        
+        while block.isValid():
+            block_text = block.text()
+            if not block_text.strip(): # Skip empty blocks
+                block = block.next()
+                continue
 
-            is_last_sentence = (i == len(self.sentence_spans) - 1)
-
-            # Define the region of text to check for a paragraph break.
-            check_start = end
-            check_end = len(full_text_for_analysis)
-            if not is_last_sentence:
-                # Look only between the end of this sentence and the start of the next one.
-                check_end = self.sentence_spans[i + 1][0]
+            # Find how many sentences from our master list fall within this block
+            first_sentence_in_block = sentence_cursor
+            block_end_pos = block.position() + block.length()
             
-            intervening_text = full_text_for_analysis[check_start:check_end]
+            while (sentence_cursor < len(self.sentence_spans) and 
+                   self.sentence_spans[sentence_cursor][1] <= block_end_pos):
+                sentence_cursor += 1
+            
+            last_sentence_in_block = sentence_cursor
+            
+            # Create a list of indices for the sentences in this paragraph/block
+            para_indices = list(range(first_sentence_in_block, last_sentence_in_block))
+            if para_indices:
+                self.paragraph_sentence_map.append(para_indices)
 
-            # If we find a double newline or it's the last sentence, this paragraph is complete.
-            if "\n\n" in intervening_text or is_last_sentence:
-                self.paragraph_sentence_map.append(current_paragraph_indices)
-                current_paragraph_indices = []
+            block = block.next()
 
         # --- Finalization ---
         print(f"Processed {len(self.sentences)} sentences in {len(self.paragraph_sentence_map)} paragraphs.")
