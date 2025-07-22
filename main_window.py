@@ -324,7 +324,6 @@ class MainWindow(QMainWindow):
         self.current_start_page = new_start_page
     
     def open_file(self):
-        # (This method is now much cleaner and fully refactored)
         if self.playback_state != "STOPPED": self.stop_tts()
         file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "All Readable Files (*.txt *.pdf *.epub);;All Files (*)")
         if not file_path: return
@@ -336,9 +335,13 @@ class MainWindow(QMainWindow):
                 self.emergency_button.setEnabled(True)
                 self._process_pdf_text(content)
             elif file_path.lower().endswith('.epub'):
-                final_html, final_plain_text = self.epub_handler.process_epub(file_path)
+                final_html, final_plain_text, ui_toc_data = self.epub_handler.process_epub(file_path)
+                print("\n--- Interactive TOC Data Received by MainWindow ---")
+                for title, anchor in ui_toc_data:
+                    print(f"  Title: {title}, Anchor: {anchor}")
                 self.text_area.setHtml(final_html)
                 self._process_epub_text(final_plain_text, update_display=False)
+                self.emergency_button.setEnabled(False)
             else:
                 with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
                 self.current_start_page = 0

@@ -10,35 +10,38 @@ class EpubHandler:
     def process_epub(self, file_path):
         """
         Main public method to process an EPUB file.
-        Returns the styled HTML and the clean plain text.
+        Returns the styled HTML, the clean plain text, and the TOC data.
         """
         print("\n--- Starting EPUB loading process ---")
         self.book = epub.read_epub(file_path)
-        chapter_groups, _ = self._get_epub_chapter_groups()
-        final_html, final_plain_text = self._process_epub_chapters(chapter_groups)
-        return final_html, final_plain_text
+
+        toc_data = self._find_essential_files_in_toc()
+        essential_hrefs = {href for title, href in toc_data}
+
+        chapter_groups, _ = self._get_epub_chapter_groups(essential_hrefs)
+        final_html, final_plain_text, ui_toc = self._process_epub_chapters(chapter_groups, toc_data)
+        return final_html, final_plain_text, ui_toc
 
     def _find_essential_files_in_toc(self):
-        # (This method was moved from MainWindow)
         print("\n--- Helper: Finding Essential Chapters from Table of Contents ---")
-        essential_files = set()
+        toc_data = []
         if not self.book.toc:
             print("[WARNING] Book has no identifiable Table of Contents (book.toc).")
-            return essential_files
+            return toc_data
 
         for link in self.book.toc:
             for keyword in self.chapter_keywords:
                 if keyword in link.title.lower():
+                    title = link.title
                     href = link.href.split('#')[0]
-                    print(f"  -> Found essential chapter in TOC: '{link.title}' -> {href}")
-                    essential_files.add(href)
+                    print(f"  -> Found essential chapter in TOC: '{title}' -> {href}")
+                    toc_data.append((title, href))
                     break
         
-        print(f"\n[RESULT] Essential files from TOC: {list(essential_files)}")
-        return essential_files
+        print(f"\n[RESULT] Essential files from TOC: {len(toc_data)} entries found. \nFiles: {toc_data}")
+        return toc_data
 
-    def _get_epub_chapter_groups(self):
-        # (This method was moved from MainWindow)
+    def _get_epub_chapter_groups(self, essential_files_from_toc):
         print("\n\n--- RUNNING 'SOURCE OF TRUTH' FILE IDENTIFICATION (VERBOSE) ---")
         skip_keywords = [
             'copyright', 'isbn', 'translation by', 'cover art', 'yen press',
@@ -48,9 +51,9 @@ class EpubHandler:
         ]
         kept_files, discarded_files, non_text_files = [], [], []
         JUNK_CHECK_LIMIT = 5
-        print(f"[CONFIG] Will check the first {JUNK_CHECK_LIMIT} real text documents for junk keywords.")
+        # print(f"[CONFIG] Will check the first {JUNK_CHECK_LIMIT} real text documents for junk keywords.")
 
-        essential_files_from_toc = self._find_essential_files_in_toc()
+        # essential_files_from_toc = self._find_essential_files_in_toc()
 
         print("\n--- PHASE 1: Splitting Spine into Kept and Discarded Files ---")
         id_to_item_map = {item.id: item for item in self.book.get_items()}
@@ -104,11 +107,12 @@ class EpubHandler:
 
         return final_chapter_groups, non_text_files
     
-    def _process_epub_chapters(self, chapter_groups):
-        # (This method was moved from MainWindow)
+    def _process_epub_chapters(self, chapter_groups, toc_data):
         print("\n--- Phase 2: Running Dual Output Processor ---")
-        html_body_parts = []
-        plain_text_parts = []
+        html_body_parts, plain_text_parts, ui_toc = [], [], []
+        
+        href_to_title_map = {href: title for title, href in toc_data}
+
         default_css = """
         <style>
             body { font-family: serif; font-size: 16px; line-height: 1.6; margin: 20px; }
@@ -116,18 +120,37 @@ class EpubHandler:
         </style>
         """
         
-        for group in chapter_groups:
+        for i, group in enumerate(chapter_groups):
+            first_file_href = group[0]
+            
+            anchor_name = f"chapter-anchor-{i}"
+            is_essential_chapter = first_file_href in href_to_title_map
+            
+            if is_essential_chapter:
+                chapter_title = href_to_title_map[first_file_href]
+                ui_toc.append((chapter_title, anchor_name))
+
             for file_href in group:
                 item = self.book.get_item_with_href(file_href)
                 if not item: continue
+                
                 soup = BeautifulSoup(item.get_content(), 'html.parser')
                 for tag in soup.find_all('link'): tag.decompose()
                 for tag in soup.find_all(style=True): del tag['style']
-                if soup.body: html_body_parts.append(str(soup.body))
-                for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
+                
+                if soup.body:
+                    if file_href == first_file_href and is_essential_chapter:
+                        anchor_tag = soup.new_tag("a", attrs={"name": anchor_name})
+                        soup.body.insert(0, anchor_tag)
+
+                    html_body_parts.append(str(soup.body))
+
+                for tag in soup.find_all(['h1', 'h2', 'h3', 'p']):
                     text = tag.get_text(strip=True)
                     if text: plain_text_parts.append(text)
         
         final_html = default_css + "".join(html_body_parts)
         final_plain_text = "\n\n".join(plain_text_parts)
-        return final_html, final_plain_text
+        
+        print(f"-> Generated {len(ui_toc)} TOC entries with anchors.")
+        return final_html, final_plain_text, ui_toc
