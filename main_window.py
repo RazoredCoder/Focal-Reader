@@ -2,25 +2,20 @@ import os
 import sys
 import configparser
 import nltk
-import azure.cognitiveservices.speech as speechsdk
+import re
 from appdirs import AppDirs
-import fitz  # Import for PyMuPDF
-import re # Import regular expressions for finding numbers
-
-import ebooklib
-from ebooklib import epub
-from bs4 import BeautifulSoup
 
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat
+from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat, QBrush
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
                                QHBoxLayout, QPushButton, QFileDialog, QMessageBox)
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
+# Local imports
 from settings_dialog import SettingsDialog
 from emergency_dialog import EmergencyDialog
 from pdf_handler import PDFHandler
 from epub_handler import EpubHandler
+from tts_handler import TTSHandler
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
@@ -46,77 +41,37 @@ class InteractiveTextEdit(QTextEdit):
         self.hovered_at_pos.emit(position)
 
 # =================================================================================
-# WORKER CLASS (Stable Version)
-# =================================================================================
-class Worker(QObject):
-    finished = Signal(QByteArray)
-    error = Signal(str)
-
-    def __init__(self, key, region, text_to_speak):
-        super().__init__()
-        self.key = key
-        self.region = region
-        self.text = text_to_speak
-
-    def run(self):
-        try:
-            if not self.key or not self.region:
-                raise ValueError("Azure credentials are not set.")
-            
-            speech_config = speechsdk.SpeechConfig(subscription=self.key, region=self.region)
-            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
-            result = synthesizer.speak_text_async(self.text).get()
-
-            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                self.finished.emit(QByteArray(result.audio_data))
-                return
-            
-            error_message = ""
-            if result.reason == speechsdk.ResultReason.Canceled:
-                error_message = "Authentication failed. Please check your Azure credentials and network connection."
-            else:
-                error_message = f"Speech synthesis failed. Reason: {result.reason}"
-            
-            self.error.emit(error_message)
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-# =================================================================================
-# MAIN WINDOW CLASS (Stable Version)
+# MAIN WINDOW CLASS
 # =================================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.thread, self.worker = None, None
         self.playback_state = "STOPPED"
         self.current_file_path, self.current_start_page = None, None
         self.toc_destinations = []
 
-        self.footer_patterns = [
-            re.compile(r'^Page\s+\d+', re.IGNORECASE),
-            re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE),
-        ]
+        self.footer_patterns = [re.compile(r'^Page\s+\d+', re.IGNORECASE), re.compile(r'^\d+\s*\|\s*P\s*a\s*g\s*e', re.IGNORECASE)]
         self.chapter_keywords = ['prologue', 'epilogue', 'chapter', 'appendix', 'afterword', 'interlude', 'side story']
         
         # --- Instantiate Handlers ---
         self.pdf_handler = PDFHandler(self.chapter_keywords, self.footer_patterns)
-        self.epub_handler = EpubHandler(self.chapter_keywords) # <-- NEW
+        self.epub_handler = EpubHandler(self.chapter_keywords)
+        self.tts_handler = TTSHandler()
 
         self.sentences, self.sentence_spans, self.paragraph_sentence_map = [], [], []
         self.current_sentence_index = 0
         self.playback_highlighter, self.hover_highlighter = None, None
         
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.player.setAudioOutput(self.audio_output)
-        self.buffer = QBuffer()
-        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
-        
         self._setup_formats()
         self._setup_config_and_nlp()
         self._setup_ui()
         self.load_and_set_credentials()
+
+        # --- NEW: Connect to TTSHandler signals ---
+        self.tts_handler.playback_started.connect(self._on_playback_started)
+        self.tts_handler.playback_finished.connect(self._on_sentence_finished)
+        self.tts_handler.playback_stopped.connect(self._on_playback_stopped)
+        self.tts_handler.error_occurred.connect(self.on_tts_error)
 
     def _setup_formats(self):
         self.playback_format = QTextCharFormat()
@@ -139,26 +94,26 @@ class MainWindow(QMainWindow):
         self.tokenizer._params.abbrev_types.update(custom_abbreviations)
 
     def _setup_ui(self):
+        # (This method is largely unchanged, just the button connections)
         self.setWindowTitle("Focal Reader")
         self.resize(800, 600)
-
+        
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
         setting_action = file_menu.addAction("Settings")
-
+        
         self.container = QWidget()
         self.setCentralWidget(self.container)
-        self.layout = QVBoxLayout()
-        self.container.setLayout(self.layout)
-
+        
+        self.layout = QVBoxLayout(self.container)
         self.text_area = InteractiveTextEdit()
         self.text_area.setReadOnly(True)
+        
         self.layout.addWidget(self.text_area)
-
         controls_container = QWidget()
         controls_layout = QHBoxLayout(controls_container)
+        
         self.layout.addWidget(controls_container)
-
         self.prev_paragraph_button = QPushButton("<< Prev Para")
         self.prev_sentence_button = QPushButton("< Prev Sent")
         self.play_button = QPushButton("Play")
@@ -166,12 +121,10 @@ class MainWindow(QMainWindow):
         self.next_paragraph_button = QPushButton("Next Para >>")
         self.stop_button = QPushButton("Stop")
         self.load_button = QPushButton("Load File")
-        self.fix_start_button = QPushButton("Fix Start")
         self.emergency_button = QPushButton("Emergency Menu")
-
+        
         controls_layout.addWidget(self.load_button)
         controls_layout.addWidget(self.emergency_button)
-        # controls_layout.addWidget(self.fix_start_button)
         controls_layout.addWidget(self.prev_paragraph_button)
         controls_layout.addWidget(self.prev_sentence_button)
         controls_layout.addWidget(self.play_button)
@@ -179,6 +132,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.next_paragraph_button)
         controls_layout.addWidget(self.stop_button)
 
+        # Connect UI elements to their actions
         setting_action.triggered.connect(self.open_settings)
         self.play_button.clicked.connect(self.play_tts)
         self.stop_button.clicked.connect(self.stop_tts)
@@ -187,18 +141,12 @@ class MainWindow(QMainWindow):
         self.next_sentence_button.clicked.connect(self.next_sentence)
         self.prev_paragraph_button.clicked.connect(self.previous_paragraph)
         self.next_paragraph_button.clicked.connect(self.next_paragraph)
-        self.fix_start_button.clicked.connect(self.load_previous_page)
         self.emergency_button.clicked.connect(self.open_emergency_menu)
-        
         self.text_area.clicked_at_pos.connect(self.on_text_area_clicked)
         self.text_area.hovered_at_pos.connect(self.on_text_area_hovered)
-
+        
         self.stop_button.setEnabled(False)
-        self.prev_sentence_button.setEnabled(False)
-        self.next_sentence_button.setEnabled(False)
-        self.prev_paragraph_button.setEnabled(False)
-        self.next_paragraph_button.setEnabled(False)
-        self.fix_start_button.setEnabled(False)
+        self.set_nav_buttons_enabled(False)
         self.emergency_button.setEnabled(False)
 
     def _apply_highlight(self, start, end, text_format):
@@ -283,93 +231,66 @@ class MainWindow(QMainWindow):
             self.play_tts()
 
     def play_tts(self):
-        if self.playback_state == "PLAYING": return
+        if self.playback_state == "PLAYING" or not self.sentences: return
+        # This check is now a bit redundant since the handler also checks, but it's good for catching issues early.
         if not self.azure_key or not self.azure_region:
             self.open_settings(); return
         
-        if not self.sentences: self._process_text(self.text_area.toPlainText())
-        if not self.sentences: return
-
         self.playback_state = "PLAYING"
-        self.play_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.prev_sentence_button.setEnabled(True)
-        self.next_sentence_button.setEnabled(True)
-        self.prev_paragraph_button.setEnabled(True)
-        self.next_paragraph_button.setEnabled(True)
-        
-        self.play_sentence(self.current_sentence_index)
+        # The line below was duplicated. This is the corrected version.
+        self._play_sentence(self.current_sentence_index)
 
-    def play_sentence(self, index):
+    def _play_sentence(self, index):
         if self.playback_state != "PLAYING" or index >= len(self.sentences):
             self.stop_tts(); return
 
         self.current_sentence_index = index
-        text = self.sentences[index]
+        text_to_speak = self.sentences[index]
         
         self._clear_highlight(self.hover_highlighter)
         self._clear_highlight(self.playback_highlighter)
         start, end = self.sentence_spans[index]
         self.playback_highlighter = self._apply_highlight(start, end, self.playback_format)
 
-        self.thread = QThread(parent=self)
-        self.worker = Worker(self.azure_key, self.azure_region, text)
-        self.worker.moveToThread(self.thread)
-
-        self.worker.error.connect(self.on_tts_error)
-        self.worker.finished.connect(self.play_audio_data)
-
-        self.thread.started.connect(self.worker.run)
-        self.thread.start()
-
-    def play_audio_data(self, audio_data):
-        if not audio_data or self.playback_state != "PLAYING":
-            self.on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
-            return
-        
-        self.player.stop()
-        self.player.setSourceDevice(None) 
-        self.buffer.close()
-        self.buffer.setData(audio_data)
-        self.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
-        self.player.setSourceDevice(self.buffer)
-        self.player.play()
-
-    def on_media_status_changed(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.playback_state == "PLAYING":
-            next_index = self.current_sentence_index + 1
-            if next_index < len(self.sentences):
-                self.play_sentence(next_index)
-            else:
-                self.stop_tts()
+        # Delegate the actual work to the handler
+        self.tts_handler.play(text_to_speak)
 
     def stop_tts(self):
         if self.playback_state == "STOPPED": return
         self.playback_state = "STOPPED"
-        self.player.stop()
-        
-        if self.thread and self.thread.isRunning():
-            self.thread.quit()
-            self.thread.wait()
-        
-        self.thread = None
-        self.worker = None
-        
-        self._clear_highlight(self.playback_highlighter)
-        self._clear_highlight(self.hover_highlighter)
+        self.tts_handler.stop()
+    
+    def _on_playback_started(self):
+        self.play_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.set_nav_buttons_enabled(True)
 
+    def _on_playback_stopped(self):
+        self._clear_highlight(self.playback_highlighter)
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.set_nav_buttons_enabled(bool(self.sentences))
+
+    def _on_sentence_finished(self):
+        """ This is the new continuous playback loop. """
+        if self.playback_state != "PLAYING": return
         
-        nav_enabled = True if self.sentences else False
-        self.prev_sentence_button.setEnabled(nav_enabled)
-        self.next_sentence_button.setEnabled(nav_enabled)
-        self.prev_paragraph_button.setEnabled(nav_enabled)
-        self.next_paragraph_button.setEnabled(nav_enabled)
+        next_index = self.current_sentence_index + 1
+        if next_index < len(self.sentences):
+            self._play_sentence(next_index)
+        else:
+            print("Finished reading all sentences.")
+            self.stop_tts()
 
     def on_tts_error(self, error_message):
         QMessageBox.critical(self, "An Azure TTS Error Occurred", error_message)
         self.stop_tts()
+    
+    def set_nav_buttons_enabled(self, enabled):
+        self.prev_sentence_button.setEnabled(enabled)
+        self.next_sentence_button.setEnabled(enabled)
+        self.prev_paragraph_button.setEnabled(enabled)
+        self.next_paragraph_button.setEnabled(enabled)
 
     def load_previous_page(self):
         if self.current_file_path is None or self.current_start_page <= 0:
@@ -383,38 +304,27 @@ class MainWindow(QMainWindow):
         self.current_start_page = new_start_page
     
     def open_file(self):
+        # (This method is now much cleaner and fully refactored)
         if self.playback_state != "STOPPED": self.stop_tts()
-        
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", 
-            "All Readable Files (*.txt *.pdf *.epub);;Text Files (*.txt);;PDF Files (*.pdf);;EPUB Files (*.epub)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "All Readable Files (*.txt *.pdf *.epub);;All Files (*)")
         if not file_path: return
-        
         self.current_file_path = file_path
-        
+        self.emergency_button.setEnabled(False) # Disable by default
         try:
             if file_path.lower().endswith('.pdf'):
                 content, self.toc_destinations, self.current_start_page = self.pdf_handler.process_pdf(file_path)
-                self.fix_start_button.setEnabled(True)
                 self.emergency_button.setEnabled(True)
                 self._process_pdf_text(content)
-            
-            # --- REFACTORED EPUB LOGIC ---
             elif file_path.lower().endswith('.epub'):
-                # Delegate all processing to the handler
                 final_html, final_plain_text = self.epub_handler.process_epub(file_path)
                 self.text_area.setHtml(final_html)
                 self._process_epub_text(final_plain_text, update_display=False)
-                self.fix_start_button.setEnabled(False)
-                self.emergency_button.setEnabled(False)
-
-            else: # TXT files
+            else:
                 with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
                 self.current_start_page = 0
                 self._process_pdf_text(content)
-
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Error Reading File", f"Could not read the file.\n\nError: {e}")
 
     def _process_pdf_text(self, raw_text):
@@ -607,3 +517,7 @@ class MainWindow(QMainWindow):
 
     def load_and_set_credentials(self):
         self.azure_key, self.azure_region = self.load_settings()
+        
+        # THE FIX: Pass the loaded credentials to the TTSHandler.
+        if self.azure_key and self.azure_region:
+            self.tts_handler.set_credentials(self.azure_key, self.azure_region)
