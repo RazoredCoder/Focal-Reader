@@ -43,7 +43,8 @@ class EpubHandler:
         skip_keywords = [
             'copyright', 'isbn', 'translation by', 'cover art', 'yen press',
             'kadawa', 'tuttle-mori', 'library of congress', 'lccn', 'e-book',
-            'ebook', 'first published', 'english translation', 'visit us at'
+            'ebook', 'first published', 'english translation', 'visit us at',
+            'novel', 'download'
         ]
         kept_files, discarded_files, non_text_files = [], [], []
         JUNK_CHECK_LIMIT = 5
