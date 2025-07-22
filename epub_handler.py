@@ -10,7 +10,7 @@ class EpubHandler:
     def process_epub(self, file_path):
         """
         Main public method to process an EPUB file.
-        Returns the styled HTML, the clean plain text, and the TOC data.
+        Returns styled HTML, plain text, TOC data, and insert images.
         """
         print("\n--- Starting EPUB loading process ---")
         self.book = epub.read_epub(file_path)
@@ -18,9 +18,10 @@ class EpubHandler:
         toc_data = self._find_essential_files_in_toc()
         essential_hrefs = {href for title, href in toc_data}
 
-        chapter_groups, _ = self._get_epub_chapter_groups(essential_hrefs)
+        chapter_groups, non_text_docs = self._get_epub_chapter_groups(essential_hrefs)
+        insert_images = self._extract_images_from_non_text_files(non_text_docs)
         final_html, final_plain_text, ui_toc = self._process_epub_chapters(chapter_groups, toc_data)
-        return final_html, final_plain_text, ui_toc
+        return final_html, final_plain_text, ui_toc, insert_images
 
     def _find_essential_files_in_toc(self):
         print("\n--- Helper: Finding Essential Chapters from Table of Contents ---")
@@ -41,6 +42,38 @@ class EpubHandler:
         print(f"\n[RESULT] Essential files from TOC: {len(toc_data)} entries found. \nFiles: {toc_data}")
         return toc_data
 
+    def _extract_images_from_non_text_files(self, non_text_docs):
+        """
+        Parses a list of non-text documents, finds image tags,
+        and extracts the actual image data from the book's manifest.
+        """
+        print("\n--- Helper: Extracting Images from Non-Text Documents ---")
+        image_data = []
+        # Create a map of all items by their file name for easy lookup
+        href_to_item_map = {item.get_name(): item for item in self.book.get_items()}
+
+        for html_content in non_text_docs:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            # Find all image tags within the document
+            for img_tag in soup.find_all('img'):
+                # The 'src' attribute often has relative paths (e.g., ../Images/cover.jpg)
+                # We need to normalize it to match the manifest.
+                img_src = img_tag.get('src')
+                if not img_src: continue
+                
+                # A simple way to handle "../" is to just take the filename part
+                clean_href = img_src.split('/')[-1]
+                
+                # Find any item in our map whose filename ends with this src
+                for item_href, item in href_to_item_map.items():
+                    if item_href.endswith(clean_href) and item.get_type() == ebooklib.ITEM_IMAGE:
+                        print(f"  -> Found embedded image: {item_href}")
+                        image_data.append(item.get_content())
+                        break
+        
+        print(f"[RESULT] Found {len(image_data)} insert images.")
+        return image_data
+
     def _get_epub_chapter_groups(self, essential_files_from_toc):
         print("\n\n--- RUNNING 'SOURCE OF TRUTH' FILE IDENTIFICATION (VERBOSE) ---")
         skip_keywords = [
@@ -49,11 +82,8 @@ class EpubHandler:
             'ebook', 'first published', 'english translation', 'visit us at',
             'novel', 'download'
         ]
-        kept_files, discarded_files, non_text_files = [], [], []
+        kept_files, discarded_files, non_text_documents_content = [], [], []
         JUNK_CHECK_LIMIT = 5
-        # print(f"[CONFIG] Will check the first {JUNK_CHECK_LIMIT} real text documents for junk keywords.")
-
-        # essential_files_from_toc = self._find_essential_files_in_toc()
 
         print("\n--- PHASE 1: Splitting Spine into Kept and Discarded Files ---")
         id_to_item_map = {item.id: item for item in self.book.get_items()}
@@ -69,9 +99,10 @@ class EpubHandler:
         for file_href in all_document_hrefs:
             item = self.book.get_item_with_href(file_href)
             text_content = BeautifulSoup(item.get_content(), 'html.parser').get_text().strip()
+            html_content = item.get_content()
 
             if not text_content:
-                non_text_files.append(file_href)
+                non_text_documents_content.append(html_content)
                 continue
 
             if documents_checked_count < JUNK_CHECK_LIMIT:
@@ -105,7 +136,7 @@ class EpubHandler:
                     current_group.append(file_href)
             final_chapter_groups.append(current_group)
 
-        return final_chapter_groups, non_text_files
+        return final_chapter_groups, non_text_documents_content
     
     def _process_epub_chapters(self, chapter_groups, toc_data):
         print("\n--- Phase 2: Running Dual Output Processor ---")

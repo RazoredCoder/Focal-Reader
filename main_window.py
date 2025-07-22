@@ -17,6 +17,8 @@ from pdf_handler import PDFHandler
 from epub_handler import EpubHandler
 from tts_handler import TTSHandler
 from toc_widget import TOCWidget
+from image_gallery_widget import ImageGalleryWidget
+from image_viewer_widget import ImageViewerWidget
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
@@ -66,13 +68,16 @@ class MainWindow(QMainWindow):
         self._setup_formats()
         self._setup_config_and_nlp()
         self._setup_ui()
+        self.image_viewer = ImageViewerWidget(self)
         self.load_and_set_credentials()
+        self.image_viewer.hide()
 
         # --- Connect to TTSHandler signals ---
         self.tts_handler.playback_started.connect(self._on_playback_started)
         self.tts_handler.playback_finished.connect(self._on_sentence_finished)
         self.tts_handler.playback_stopped.connect(self._on_playback_stopped)
         self.tts_handler.error_occurred.connect(self.on_tts_error)
+        self.image_gallery.thumbnail_clicked.connect(self.image_viewer.show_image)
 
     def _setup_ui(self):
         self.setWindowTitle("Focal Reader")
@@ -99,6 +104,9 @@ class MainWindow(QMainWindow):
         
         self.toc_widget = TOCWidget()
         self.right_panel_layout.addWidget(self.toc_widget)
+
+        self.image_gallery = ImageGalleryWidget()
+        self.right_panel_layout.addWidget(self.image_gallery)
 
         self.splitter.addWidget(self.text_area)
         self.splitter.addWidget(self.right_panel)
@@ -151,6 +159,12 @@ class MainWindow(QMainWindow):
         self.set_nav_buttons_enabled(False)
         self.emergency_button.setEnabled(False)
 
+    def resizeEvent(self, event):
+        """Ensures the image viewer overlay is resized whenever the main window is."""
+        super().resizeEvent(event)
+        # Check if the image_viewer has been created yet
+        if hasattr(self, 'image_viewer'):
+            self.image_viewer.setGeometry(0, 0, self.width(), self.height())
 
     def _setup_formats(self):
         self.playback_format = QTextCharFormat()
@@ -343,11 +357,13 @@ class MainWindow(QMainWindow):
                 self.emergency_button.setEnabled(True)
                 self._process_pdf_text(content)
             elif file_path.lower().endswith('.epub'):
-                final_html, final_plain_text, ui_toc_data = self.epub_handler.process_epub(file_path)
+                final_html, final_plain_text, ui_toc_data, insert_images = self.epub_handler.process_epub(file_path)
+                print(f"\n--- MainWindow received {len(insert_images)} insert images ---")
                 print("\n--- Interactive TOC Data Received by MainWindow ---")
                 for title, anchor in ui_toc_data:
                     print(f"  Title: {title}, Anchor: {anchor}")
                 self.toc_widget.populate_toc(ui_toc_data)
+                self.image_gallery.populate_gallery(insert_images)
                 self.text_area.setHtml(final_html)
                 self._process_epub_text(final_plain_text, update_display=False)
                 self.emergency_button.setEnabled(False)
