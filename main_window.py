@@ -16,6 +16,7 @@ from emergency_dialog import EmergencyDialog
 from pdf_handler import PDFHandler
 from epub_handler import EpubHandler
 from tts_handler import TTSHandler
+from toc_widget import TOCWidget
 
 # =================================================================================
 # ENHANCED TEXT EDIT WIDGET
@@ -67,7 +68,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self.load_and_set_credentials()
 
-        # --- NEW: Connect to TTSHandler signals ---
+        # --- Connect to TTSHandler signals ---
         self.tts_handler.playback_started.connect(self._on_playback_started)
         self.tts_handler.playback_finished.connect(self._on_sentence_finished)
         self.tts_handler.playback_stopped.connect(self._on_playback_stopped)
@@ -96,9 +97,11 @@ class MainWindow(QMainWindow):
         self.right_panel_layout = QVBoxLayout(self.right_panel)
         self.right_panel.setStyleSheet("background-color: #fafafa;") 
         
+        self.toc_widget = TOCWidget()
+        self.right_panel_layout.addWidget(self.toc_widget)
+
         self.splitter.addWidget(self.text_area)
         self.splitter.addWidget(self.right_panel)
-        
         self.splitter.setSizes([600, 200])
         self.splitter.setStretchFactor(0, 1)
 
@@ -127,10 +130,10 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.stop_button)
         
         self.main_layout.addWidget(controls_container, 0)
-
         self.setCentralWidget(self.container)
 
         # --- Connections ---
+        self.toc_widget.toc_entry_selected.connect(self.jump_to_anchor)
         setting_action.triggered.connect(self.open_settings)
         self.play_button.clicked.connect(self.play_tts)
         self.stop_button.clicked.connect(self.stop_tts)
@@ -323,6 +326,11 @@ class MainWindow(QMainWindow):
         self._process_pdf_text(content)
         self.current_start_page = new_start_page
     
+    def jump_to_anchor(self, anchor_name):
+        """Scrolls the text area to the specified HTML anchor."""
+        print(f"Jumping to anchor: {anchor_name}")
+        self.text_area.scrollToAnchor(anchor_name)
+    
     def open_file(self):
         if self.playback_state != "STOPPED": self.stop_tts()
         file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "All Readable Files (*.txt *.pdf *.epub);;All Files (*)")
@@ -339,6 +347,7 @@ class MainWindow(QMainWindow):
                 print("\n--- Interactive TOC Data Received by MainWindow ---")
                 for title, anchor in ui_toc_data:
                     print(f"  Title: {title}, Anchor: {anchor}")
+                self.toc_widget.populate_toc(ui_toc_data)
                 self.text_area.setHtml(final_html)
                 self._process_epub_text(final_plain_text, update_display=False)
                 self.emergency_button.setEnabled(False)
