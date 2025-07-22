@@ -8,7 +8,8 @@ from appdirs import AppDirs
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat, QBrush
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
-                               QHBoxLayout, QPushButton, QFileDialog, QMessageBox, QSplitter)
+                               QHBoxLayout, QPushButton, QFileDialog, QMessageBox, 
+                               QSplitter, QStackedWidget)
 
 # Local imports
 from settings_dialog import SettingsDialog
@@ -19,29 +20,8 @@ from tts_handler import TTSHandler
 from toc_widget import TOCWidget
 from image_gallery_widget import ImageGalleryWidget
 from image_viewer_widget import ImageViewerWidget
-
-# =================================================================================
-# ENHANCED TEXT EDIT WIDGET
-# =================================================================================
-class InteractiveTextEdit(QTextEdit):
-    clicked_at_pos = Signal(int)
-    hovered_at_pos = Signal(int)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMouseTracking(True)
-
-    def mousePressEvent(self, event):
-        super().mousePressEvent(event)
-        cursor = self.cursorForPosition(event.pos())
-        position = cursor.position()
-        self.clicked_at_pos.emit(position)
-
-    def mouseMoveEvent(self, event):
-        super().mouseMoveEvent(event)
-        cursor = self.cursorForPosition(event.pos())
-        position = cursor.position()
-        self.hovered_at_pos.emit(position)
+from sidebar_widget import SidebarWidget
+from interactive_text_edit import InteractiveTextEdit
 
 # =================================================================================
 # MAIN WINDOW CLASS
@@ -70,52 +50,63 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self.image_viewer = ImageViewerWidget(self)
         self.load_and_set_credentials()
-        self.image_viewer.hide()
 
         # --- Connect to TTSHandler signals ---
         self.tts_handler.playback_started.connect(self._on_playback_started)
         self.tts_handler.playback_finished.connect(self._on_sentence_finished)
         self.tts_handler.playback_stopped.connect(self._on_playback_stopped)
         self.tts_handler.error_occurred.connect(self.on_tts_error)
+        self.toc_widget.toc_entry_selected.connect(self.jump_to_anchor)
         self.image_gallery.thumbnail_clicked.connect(self.image_viewer.show_image)
+        self.sidebar.show_toc_requested.connect(self.show_toc_view)
+        self.sidebar.show_gallery_requested.connect(self.show_gallery_view)
 
     def _setup_ui(self):
         self.setWindowTitle("Focal Reader")
-        self.resize(800, 600)
+        self.resize(900, 600)
         
-        # --- Menus ---
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
         setting_action = file_menu.addAction("Settings")
         
-        # --- Main Layout Structure ---
         self.container = QWidget()
         self.main_layout = QVBoxLayout(self.container)
-
-        # --- Two-Column Splitter ---
         self.splitter = QSplitter(Qt.Horizontal)
         
+        # --- Left Panel ---
         self.text_area = InteractiveTextEdit()
         self.text_area.setReadOnly(True)
         
+        # --- Right Panel (with sidebar on the far right) ---
         self.right_panel = QWidget()
-        self.right_panel_layout = QVBoxLayout(self.right_panel)
-        self.right_panel.setStyleSheet("background-color: #fafafa;") 
+        right_panel_main_layout = QHBoxLayout(self.right_panel)
+        right_panel_main_layout.setContentsMargins(0, 0, 0, 0)
+        right_panel_main_layout.setSpacing(0)
+
+        self.sidebar = SidebarWidget()
+        self.stacked_widget = QStackedWidget()
         
         self.toc_widget = TOCWidget()
-        self.right_panel_layout.addWidget(self.toc_widget)
-
         self.image_gallery = ImageGalleryWidget()
-        self.right_panel_layout.addWidget(self.image_gallery)
+        
+        self.stacked_widget.addWidget(self.toc_widget)
+        self.stacked_widget.addWidget(self.image_gallery)
 
+        # --- THE FIX IS HERE ---
+        # 1. Add the content panel (stacked_widget) first.
+        # 2. Add the thin sidebar last, so it appears on the far right.
+        # 3. Add stretch factors to make the content panel expand.
+        right_panel_main_layout.addWidget(self.stacked_widget, 1) # Stretch factor of 1 (expands)
+        right_panel_main_layout.addWidget(self.sidebar, 0)      # Stretch factor of 0 (fixed size)
+        
+        # --- Assemble Splitter ---
         self.splitter.addWidget(self.text_area)
         self.splitter.addWidget(self.right_panel)
-        self.splitter.setSizes([600, 200])
+        self.splitter.setSizes([600, 300])
         self.splitter.setStretchFactor(0, 1)
-
+        
         self.main_layout.addWidget(self.splitter, 1)
         
-        # --- Control Buttons ---
         controls_container = QWidget()
         controls_layout = QHBoxLayout(controls_container)
         
@@ -159,6 +150,14 @@ class MainWindow(QMainWindow):
         self.set_nav_buttons_enabled(False)
         self.emergency_button.setEnabled(False)
 
+    def show_toc_view(self):
+        print("Switching to TOC view")
+        self.stacked_widget.setCurrentWidget(self.toc_widget)
+
+    def show_gallery_view(self):
+        print("Switching to Image Gallery view")
+        self.stacked_widget.setCurrentWidget(self.image_gallery)
+    
     def resizeEvent(self, event):
         """Ensures the image viewer overlay is resized whenever the main window is."""
         super().resizeEvent(event)
