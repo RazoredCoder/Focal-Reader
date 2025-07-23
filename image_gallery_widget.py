@@ -5,7 +5,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QLabel
 from thumbnail_widget import ThumbnailWidget
 
 class ImageGalleryWidget(QWidget):
-    thumbnail_clicked = Signal(QPixmap)
+    thumbnail_clicked = Signal(str, QPixmap)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -28,20 +28,24 @@ class ImageGalleryWidget(QWidget):
 
     def populate_gallery(self, image_data_list):
         """
-        Clears the gallery and populates it with new thumbnails.
+        Clears the gallery, populates it with new thumbnails,
+        and returns a list of the created thumbnail widgets.
         """
-        # A robust way to clear all widgets from the layout
         while self.gallery_layout.count():
             item = self.gallery_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-
+        
+        created_thumbnails = []
         if not image_data_list:
             self.gallery_layout.addWidget(QLabel("No insert images found."))
-            return
+            return created_thumbnails
 
-        for image_data in image_data_list:
-            thumbnail = ThumbnailWidget(image_data)
+        for image_tuple in image_data_list:
+            thumbnail = ThumbnailWidget(image_tuple)
             thumbnail.clicked.connect(self.thumbnail_clicked)
             self.gallery_layout.addWidget(thumbnail)
+            created_thumbnails.append(thumbnail)
+        
+        return created_thumbnails

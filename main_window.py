@@ -5,7 +5,7 @@ import nltk
 import re
 from appdirs import AppDirs
 
-from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat, QBrush
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit, 
                                QHBoxLayout, QPushButton, QFileDialog, QMessageBox, 
@@ -57,7 +57,8 @@ class MainWindow(QMainWindow):
         self.tts_handler.playback_stopped.connect(self._on_playback_stopped)
         self.tts_handler.error_occurred.connect(self.on_tts_error)
         self.toc_widget.toc_entry_selected.connect(self.jump_to_anchor)
-        self.collapsible_gallery.thumbnail_clicked.connect(self.image_viewer.show_image)
+        self.collapsible_gallery.thumbnail_clicked.connect(self._on_thumbnail_clicked)
+        self.collapsible_gallery.tool_box.currentChanged.connect(self.collapsible_gallery.unhighlight_all)
         self.sidebar.show_toc_requested.connect(self.show_toc_view)
         self.sidebar.show_gallery_requested.connect(self.show_gallery_view)
 
@@ -76,6 +77,7 @@ class MainWindow(QMainWindow):
         # --- Left Panel ---
         self.text_area = InteractiveTextEdit()
         self.text_area.setReadOnly(True)
+        self.text_area.anchorClicked.connect(self._on_placeholder_clicked)
         
         # --- Right Panel (with sidebar on the far right) ---
         self.right_panel = QWidget()
@@ -85,17 +87,11 @@ class MainWindow(QMainWindow):
 
         self.sidebar = SidebarWidget()
         self.stacked_widget = QStackedWidget()
-        
         self.toc_widget = TOCWidget()
         self.collapsible_gallery = CollapsibleGallery()
-        
         self.stacked_widget.addWidget(self.toc_widget)
         self.stacked_widget.addWidget(self.collapsible_gallery)
 
-        # --- THE FIX IS HERE ---
-        # 1. Add the content panel (stacked_widget) first.
-        # 2. Add the thin sidebar last, so it appears on the far right.
-        # 3. Add stretch factors to make the content panel expand.
         right_panel_main_layout.addWidget(self.stacked_widget, 1) # Stretch factor of 1 (expands)
         right_panel_main_layout.addWidget(self.sidebar, 0)      # Stretch factor of 0 (fixed size)
         
@@ -104,7 +100,6 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.right_panel)
         self.splitter.setSizes([600, 300])
         self.splitter.setStretchFactor(0, 1)
-        
         self.main_layout.addWidget(self.splitter, 1)
         
         controls_container = QWidget()
@@ -153,10 +148,31 @@ class MainWindow(QMainWindow):
     def show_toc_view(self):
         print("Switching to TOC view")
         self.stacked_widget.setCurrentWidget(self.toc_widget)
+        # Condition b) Un-highlight when view changes
+        self.collapsible_gallery.unhighlight_all()
 
     def show_gallery_view(self):
         print("Switching to Image Gallery view")
         self.stacked_widget.setCurrentWidget(self.collapsible_gallery)
+    
+    def _on_thumbnail_clicked(self, image_id, pixmap):
+        self.collapsible_gallery.highlight_thumbnail(image_id)
+        self.image_viewer.show_image(pixmap)
+
+    def _on_placeholder_clicked(self, url: QUrl):
+        url_str = url.toString()
+        print(f"Link clicked: {url_str}")
+        
+        if url_str.startswith("focal-reader:image:"):
+            image_id = url_str.replace("focal-reader:image:", "")
+            
+            # --- The 6-Step Plan ---
+            if self.playback_state == "PLAYING": self.stop_tts()
+            self.show_gallery_view()
+            self.collapsible_gallery.highlight_thumbnail(image_id)
+            
+            thumbnail = self.collapsible_gallery.thumbnail_map.get(image_id)
+            if thumbnail: self.image_viewer.show_image(thumbnail.full_pixmap)
     
     def resizeEvent(self, event):
         """Ensures the image viewer overlay is resized whenever the main window is."""
@@ -306,6 +322,7 @@ class MainWindow(QMainWindow):
         self.play_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.set_nav_buttons_enabled(bool(self.sentences))
+        self.collapsible_gallery.unhighlight_all()
 
     def _on_sentence_finished(self):
         """ This is the new continuous playback loop. """
@@ -356,18 +373,28 @@ class MainWindow(QMainWindow):
                 self.emergency_button.setEnabled(True)
                 self._process_pdf_text(content)
             elif file_path.lower().endswith('.epub'):
-                # The handler now returns the grouped_images dictionary
                 final_html, final_plain_text, ui_toc_data, grouped_images = self.epub_handler.process_epub(file_path)
                 
-                # --- For Debugging: Print the new image structure ---
-                print("\n--- MainWindow received grouped images ---")
-                print(f"  Cover Images: {len(grouped_images['cover'])}")
-                for i, chapter_imgs in enumerate(grouped_images['chapters']):
-                    print(f"  Chapter {i+1} Images: {len(chapter_imgs)}")
-                print(f"  Ending Images: {len(grouped_images['ending'])}")
+                # --- For Debugging: Confirm we received the images with their IDs ---
+                print("\n--- MainWindow received grouped images with IDs ---")
+                for category, images in grouped_images.items():
+                    if category == 'chapters':
+                        for i, chapter_imgs in enumerate(images):
+                            if chapter_imgs:
+                                print(f"  Chapter {i+1} Images: {len(chapter_imgs)} -> IDs: {[img_id for img_id, data in chapter_imgs]}")
+                    elif images:
+                        print(f"  {category.capitalize()} Images: {len(images)} -> IDs: {[img_id for img_id, data in images]}")
 
-                self.collapsible_gallery.populate(grouped_images, ui_toc_data)
                 self.toc_widget.populate_toc(ui_toc_data)
+                
+                # We will update this in the next step to pass the new data structure
+                # For now, we extract just the image data to keep the gallery working
+                all_image_data = grouped_images.get('cover', [])
+                for chapter_list in grouped_images.get('chapters', []):
+                    all_image_data.extend(chapter_list)
+                all_image_data.extend(grouped_images.get('ending', []))
+                
+                self.collapsible_gallery.populate(grouped_images, ui_toc_data)
                 
                 self.text_area.setHtml(final_html)
                 self._process_epub_text(final_plain_text, update_display=False)

@@ -1,7 +1,7 @@
 from PySide6.QtCore import QObject, QThread, Signal, QBuffer, QByteArray, QIODevice, Qt
-from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextEdit)
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTextBrowser)
 
-class InteractiveTextEdit(QTextEdit):
+class InteractiveTextEdit(QTextBrowser):
     clicked_at_pos = Signal(int)
     hovered_at_pos = Signal(int)
 
