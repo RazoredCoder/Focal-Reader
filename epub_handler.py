@@ -10,19 +10,77 @@ class EpubHandler:
     def process_epub(self, file_path):
         """
         Main public method to process an EPUB file.
-        Returns styled HTML, plain text, TOC data, and insert images.
+        Returns styled HTML, plain text, TOC data, and grouped insert images.
         """
-        print("\n--- Starting EPUB loading process ---")
         self.book = epub.read_epub(file_path)
 
         toc_data = self._find_essential_files_in_toc()
         essential_hrefs = {href for title, href in toc_data}
 
-        chapter_groups, non_text_docs = self._get_epub_chapter_groups(essential_hrefs)
-        insert_images = self._extract_images_from_non_text_files(non_text_docs)
-        final_html, final_plain_text, ui_toc = self._process_epub_chapters(chapter_groups, toc_data)
-        return final_html, final_plain_text, ui_toc, insert_images
+        chapter_groups, non_text_docs, all_docs_in_order = self._get_epub_chapter_groups(essential_hrefs)
+        
+        # This now returns a map of {href: image_data}
+        image_map = self._extract_images_from_non_text_files(non_text_docs)
 
+        # NEW: Group the extracted images
+        grouped_images = self._group_images(chapter_groups, image_map, all_docs_in_order)
+
+        final_html, final_plain_text, ui_toc = self._process_epub_chapters(chapter_groups, toc_data)
+        
+        return final_html, final_plain_text, ui_toc, grouped_images
+
+    def _group_images(self, chapter_groups, image_map, all_docs_in_order):
+        """
+        Categorizes images into cover, chapter-specific, and ending groups.
+        """
+        print("\n--- Helper: Grouping images ---")
+        grouped = {
+            "cover": [],
+            "chapters": [[] for _ in chapter_groups],
+            "ending": []
+        }
+        
+        if not chapter_groups: # Handle books with no chapters
+            for href, img_data in image_map.items():
+                grouped["cover"].append(img_data)
+            return grouped
+
+        # Find the start and end points of the main chapter content
+        first_chapter_start_index = all_docs_in_order.index(chapter_groups[0][0])
+        last_chapter_end_index = all_docs_in_order.index(chapter_groups[-1][-1])
+
+        # Create a map of file hrefs to their chapter index
+        href_to_chapter_index = {}
+        for i, group in enumerate(chapter_groups):
+            for href in group:
+                href_to_chapter_index[href] = i
+
+        # Categorize each non-text document
+        for i, doc_href in enumerate(all_docs_in_order):
+            if doc_href in image_map:
+                image_content = image_map[doc_href]
+                if i < first_chapter_start_index:
+                    grouped["cover"].extend(image_content)
+                elif i > last_chapter_end_index:
+                    grouped["ending"].extend(image_content)
+                else:
+                    # Find which chapter this image belongs to
+                    # by looking for the last seen chapter start
+                    current_chapter_index = -1
+                    for doc_idx in range(i, -1, -1):
+                        potential_chapter_href = all_docs_in_order[doc_idx]
+                        if potential_chapter_href in href_to_chapter_index:
+                            current_chapter_index = href_to_chapter_index[potential_chapter_href]
+                            break
+                    if current_chapter_index != -1:
+                        grouped["chapters"][current_chapter_index].extend(image_content)
+
+        print(f"[RESULT] Image Groups: {len(grouped['cover'])} cover, "
+              f"{sum(len(c) for c in grouped['chapters'])} chapter, "
+              f"{len(grouped['ending'])} ending images.")
+        return grouped
+
+    
     def _find_essential_files_in_toc(self):
         print("\n--- Helper: Finding Essential Chapters from Table of Contents ---")
         toc_data = []
@@ -48,31 +106,25 @@ class EpubHandler:
         and extracts the actual image data from the book's manifest.
         """
         print("\n--- Helper: Extracting Images from Non-Text Documents ---")
-        image_data = []
-        # Create a map of all items by their file name for easy lookup
+        image_map = {} # Returns a map of {doc_href: [image_data_list]}
         href_to_item_map = {item.get_name(): item for item in self.book.get_items()}
 
-        for html_content in non_text_docs:
+        for doc_href, html_content in non_text_docs.items():
             soup = BeautifulSoup(html_content, 'html.parser')
-            # Find all image tags within the document
+            doc_images = []
             for img_tag in soup.find_all('img'):
-                # The 'src' attribute often has relative paths (e.g., ../Images/cover.jpg)
-                # We need to normalize it to match the manifest.
                 img_src = img_tag.get('src')
                 if not img_src: continue
-                
-                # A simple way to handle "../" is to just take the filename part
                 clean_href = img_src.split('/')[-1]
-                
-                # Find any item in our map whose filename ends with this src
                 for item_href, item in href_to_item_map.items():
                     if item_href.endswith(clean_href) and item.get_type() == ebooklib.ITEM_IMAGE:
-                        print(f"  -> Found embedded image: {item_href}")
-                        image_data.append(item.get_content())
+                        doc_images.append(item.get_content())
                         break
+            if doc_images:
+                image_map[doc_href] = doc_images
         
-        print(f"[RESULT] Found {len(image_data)} insert images.")
-        return image_data
+        print(f"[RESULT] Found images in {len(image_map)} non-text documents.")
+        return image_map
 
     def _get_epub_chapter_groups(self, essential_files_from_toc):
         print("\n\n--- RUNNING 'SOURCE OF TRUTH' FILE IDENTIFICATION (VERBOSE) ---")
@@ -82,7 +134,8 @@ class EpubHandler:
             'ebook', 'first published', 'english translation', 'visit us at',
             'novel', 'download'
         ]
-        kept_files, discarded_files, non_text_documents_content = [], [], []
+        kept_files, discarded_files = [], []
+        non_text_documents_content = {}
         JUNK_CHECK_LIMIT = 5
 
         print("\n--- PHASE 1: Splitting Spine into Kept and Discarded Files ---")
@@ -102,7 +155,7 @@ class EpubHandler:
             html_content = item.get_content()
 
             if not text_content:
-                non_text_documents_content.append(html_content)
+                non_text_documents_content[file_href] = item.get_content()
                 continue
 
             if documents_checked_count < JUNK_CHECK_LIMIT:
@@ -136,7 +189,7 @@ class EpubHandler:
                     current_group.append(file_href)
             final_chapter_groups.append(current_group)
 
-        return final_chapter_groups, non_text_documents_content
+        return final_chapter_groups, non_text_documents_content, all_document_hrefs
     
     def _process_epub_chapters(self, chapter_groups, toc_data):
         print("\n--- Phase 2: Running Dual Output Processor ---")

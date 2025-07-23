@@ -18,10 +18,10 @@ from pdf_handler import PDFHandler
 from epub_handler import EpubHandler
 from tts_handler import TTSHandler
 from toc_widget import TOCWidget
-from image_gallery_widget import ImageGalleryWidget
 from image_viewer_widget import ImageViewerWidget
 from sidebar_widget import SidebarWidget
 from interactive_text_edit import InteractiveTextEdit
+from collapsible_gallery import CollapsibleGallery
 
 # =================================================================================
 # MAIN WINDOW CLASS
@@ -57,7 +57,7 @@ class MainWindow(QMainWindow):
         self.tts_handler.playback_stopped.connect(self._on_playback_stopped)
         self.tts_handler.error_occurred.connect(self.on_tts_error)
         self.toc_widget.toc_entry_selected.connect(self.jump_to_anchor)
-        self.image_gallery.thumbnail_clicked.connect(self.image_viewer.show_image)
+        self.collapsible_gallery.thumbnail_clicked.connect(self.image_viewer.show_image)
         self.sidebar.show_toc_requested.connect(self.show_toc_view)
         self.sidebar.show_gallery_requested.connect(self.show_gallery_view)
 
@@ -87,10 +87,10 @@ class MainWindow(QMainWindow):
         self.stacked_widget = QStackedWidget()
         
         self.toc_widget = TOCWidget()
-        self.image_gallery = ImageGalleryWidget()
+        self.collapsible_gallery = CollapsibleGallery()
         
         self.stacked_widget.addWidget(self.toc_widget)
-        self.stacked_widget.addWidget(self.image_gallery)
+        self.stacked_widget.addWidget(self.collapsible_gallery)
 
         # --- THE FIX IS HERE ---
         # 1. Add the content panel (stacked_widget) first.
@@ -156,7 +156,7 @@ class MainWindow(QMainWindow):
 
     def show_gallery_view(self):
         print("Switching to Image Gallery view")
-        self.stacked_widget.setCurrentWidget(self.image_gallery)
+        self.stacked_widget.setCurrentWidget(self.collapsible_gallery)
     
     def resizeEvent(self, event):
         """Ensures the image viewer overlay is resized whenever the main window is."""
@@ -356,13 +356,19 @@ class MainWindow(QMainWindow):
                 self.emergency_button.setEnabled(True)
                 self._process_pdf_text(content)
             elif file_path.lower().endswith('.epub'):
-                final_html, final_plain_text, ui_toc_data, insert_images = self.epub_handler.process_epub(file_path)
-                print(f"\n--- MainWindow received {len(insert_images)} insert images ---")
-                print("\n--- Interactive TOC Data Received by MainWindow ---")
-                for title, anchor in ui_toc_data:
-                    print(f"  Title: {title}, Anchor: {anchor}")
+                # The handler now returns the grouped_images dictionary
+                final_html, final_plain_text, ui_toc_data, grouped_images = self.epub_handler.process_epub(file_path)
+                
+                # --- For Debugging: Print the new image structure ---
+                print("\n--- MainWindow received grouped images ---")
+                print(f"  Cover Images: {len(grouped_images['cover'])}")
+                for i, chapter_imgs in enumerate(grouped_images['chapters']):
+                    print(f"  Chapter {i+1} Images: {len(chapter_imgs)}")
+                print(f"  Ending Images: {len(grouped_images['ending'])}")
+
+                self.collapsible_gallery.populate(grouped_images, ui_toc_data)
                 self.toc_widget.populate_toc(ui_toc_data)
-                self.image_gallery.populate_gallery(insert_images)
+                
                 self.text_area.setHtml(final_html)
                 self._process_epub_text(final_plain_text, update_display=False)
                 self.emergency_button.setEnabled(False)
